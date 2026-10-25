@@ -18,11 +18,11 @@ def to_numpy(value) -> np.ndarray:
     """Convert an array-like (including torch tensors) to a NumPy array without
     changing any value. Sub-float32 floating types are widened exactly."""
     if is_torch_tensor(value):
-        tensor = value.detach()
+        tensor = value.detach().cpu()  # move first, then convert (accelerator casts are not always exact)
         if tensor.is_floating_point() and str(tensor.dtype) not in (
                 "torch.float16", "torch.float32", "torch.float64"):
             tensor = tensor.float()
-        return tensor.cpu().numpy()
+        return tensor.numpy()
     array = np.asarray(value)
     # Note the underscores: "float64".startswith("float6") is True.
     if array.dtype.name == "bfloat16" or array.dtype.name.startswith(("float8_", "float6_", "float4_")):

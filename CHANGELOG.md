@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 — 2026-10-25
+
+Real-world validation and the features it called for.
+
+### Added
+- `selection_keys` / `boundary_ties`: emulate the engine's selection keys in FP32/BF16 and find tokens
+  with exact ties at the top-k or group boundary. These are the tie mechanism behind sglang#30989, where
+  GLM-5.2-NVFP4 produced NaN expert weights. `compare_routing` reports them, and `sweep` adds an
+  `fp32-key ties` column.
+- Remote checkpoints: `Checkpoint("hf://org/name[@rev]")` and `routerlab inspect hf://...` read
+  safetensors headers and router tensors by HTTP range requests, with no download. The auth token is
+  sent only to the Hub host, transient failures are retried, and shard headers are fetched in parallel.
+- `inspect --stats` bias diagnostics: how many expert biases a BF16 cast would merge, and the FP32
+  spacing at the bias magnitude. On DeepSeek-V3 a BF16 cast merges 62% of expert pairs; on
+  GLM-4.5-Air up to 98% in one layer.
+- `RouterCapture` records the logits each router computed (in its own dtype and kernels) as well as
+  its inputs. `routerlab compare run_a.safetensors run_b.safetensors` compares two runs directly.
+- vLLM `routed_experts` support: `[tokens, layers, k]` arrays are split per layer and matched to the
+  reference routers in layer order.
+- Case studies on real models with real text (OLMoE-1B-7B, LFM2-8B-A1B; `docs/case-studies/`),
+  produced by `examples/real_model_study.py`. `docs/WHY.md` covers incidents and use cases.
+- Property-based tests (Hypothesis), with a weekly stress profile in CI.
+
+### Fixed
+- Capture on Apple MPS: on torch 2.14, `tensor.to("cpu", torch.float64)` of an MPS bfloat16 tensor
+  returns wrong values. RouterLab now moves to the CPU first, then widens, everywhere.
+- Renormalised weights were NaN when every selected score underflowed (e.g. sigmoid(-800)). They
+  are now computed exactly in log space.
+- `robustness_radius` could report `inf` for softmax routers with a correction bias when the
+  slope-based lower bound was tiny. Bracketing now starts at the logit scale. Found by Hypothesis.
+
 ## 0.2.0 — 2026-10-25
 
 RouterLab is now a general-purpose library and CLI for auditing MoE routers.

@@ -9,6 +9,7 @@ from ._version import __version__
 from .certify import certify, robustness_radius, selection_bounds
 from .checkpoint import Checkpoint, RouterTensors, SafetensorsFile, save_safetensors
 from .compare import RoutingReport, as_routing, compare_routing, format_reports
+from .keys import boundary_ties, selection_keys
 from .precision import FORMATS, FloatFormat, is_representable, quantize, quantize_scaled, resolve_format, round_bf16
 from .projection import project, projection_error_bound
 from .routing import SUPPORTED_MODEL_TYPES, RouterSpec, Routing, route, topk_indices
@@ -20,6 +21,7 @@ __all__ = [
     "RouterSpec", "Routing", "route", "topk_indices", "SUPPORTED_MODEL_TYPES",
     "certify", "robustness_radius", "selection_bounds",
     "RoutingReport", "compare_routing", "as_routing", "format_reports",
+    "selection_keys", "boundary_ties",
     "assert_routing_close",
     "project", "projection_error_bound",
     "FloatFormat", "FORMATS", "quantize", "quantize_scaled", "round_bf16", "resolve_format", "is_representable",

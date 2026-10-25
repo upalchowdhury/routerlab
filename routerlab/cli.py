@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from ._version import __version__
 from .checkpoint import Checkpoint, SafetensorsFile
 from .compare import RoutingReport, _jsonable, compare_routing, format_reports
 from .precision import is_representable
+from .remote import is_remote
 from .routing import RouterSpec
 from .sweep import DEFAULT_CONFIGS, PrecisionConfig, precision_sweep
 
@@ -58,6 +60,36 @@ def load_arrays(path) -> dict[str, np.ndarray]:
     raise SystemExit(f"Unsupported file type {path.suffix!r} (use .npy, .npz, .safetensors, or .pt)")
 
 
+def load_capture_arrays(path, *, recompute: bool = False):
+    """Capture file -> ({'NAME/logits': ..., 'NAME/correction_bias': ...}, RouterSpec | None).
+
+    Uses the logits the captured run computed; with `recompute` (or when the
+    capture holds no logits) recomputes exact float64 logits from its inputs."""
+    from .capture import load_capture
+    from .projection import project
+
+    records, spec = load_capture(path)
+    arrays = {}
+    for name, rec in records.items():
+        if rec.logits is not None and not recompute:
+            arrays[f"{name}/logits"] = rec.logits
+        elif rec.hidden_states is not None:
+            arrays[f"{name}/logits"] = project(rec.hidden_states, rec.weight, rec.linear_bias)
+        else:
+            raise SystemExit(f"{path}: router {name} has neither logits nor hidden states")
+        if rec.correction_bias is not None:
+            arrays[f"{name}/correction_bias"] = rec.correction_bias
+    return arrays, spec
+
+
+def _load_inputs(path, recompute: bool):
+    from .capture import is_capture_file
+
+    if Path(path).suffix.lower() == ".safetensors" and is_capture_file(path):
+        return load_capture_arrays(path, recompute=recompute)
+    return load_arrays(path), None
+
+
 def _single_array(path) -> np.ndarray:
     arrays = load_arrays(path)
     if len(arrays) != 1:
@@ -79,8 +111,25 @@ def group_arrays(arrays: dict[str, np.ndarray]) -> dict[str, dict[str, np.ndarra
                 break
         if kind is None:
             kind = "ids" if value.dtype.kind in "iu" else "logits"
+        if kind == "ids" and value.ndim == 3:
+            # vLLM routed_experts: [tokens, moe_layers, top_k] -> one group per MoE layer
+            for j in range(value.shape[1]):
+                groups.setdefault(f"{name or 'routed_experts'}[{j}]", {})["ids"] = value[:, j, :]
+            continue
         groups.setdefault(name, {})[kind] = value
     return groups
+
+
+_LAYER_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_SLICE_INDEX = re.compile(r"\[(\d+)\]$")
+
+
+def _layer_order(name: str):
+    """Sort key: HF-style 'layers.N' first, else natural order ('layer2' before 'layer10')."""
+    match = _LAYER_INDEX.search(name)
+    if match:
+        return (0, int(match.group(1)), ())
+    return (1, 0, tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", name)))
 
 
 def _spec_from_args(args, num_experts: int | None = None) -> RouterSpec:
@@ -137,19 +186,37 @@ def cmd_inspect(args) -> int:
             out["notes"].extend(spec.notes)
         except ValueError as exc:
             out["notes"].append(str(exc))
-    for router in routers:
-        row = router.to_dict()
-        if args.stats:
-            weight, bias, linear = ckpt.load_router(router)
-            row["weight_abs_max"] = float(np.abs(weight).max())
-            row["weight_abs_mean"] = float(np.abs(weight).mean())
-            if router.dtype in ("F32", "F64"):
-                row["weight_bf16_representable"] = bool(is_representable(weight, "bf16").all())
-            if bias is not None:
-                row["bias_min"], row["bias_max"] = float(bias.min()), float(bias.max())
-        out["routers"].append(row)
+    def stats(router):
+        weight, bias, _ = ckpt.load_router(router)
+        row = {"weight_abs_max": float(np.abs(weight).max()), "weight_abs_mean": float(np.abs(weight).mean())}
+        if router.dtype in ("F32", "F64"):
+            row["weight_bf16_representable"] = bool(is_representable(weight, "bf16").all())
+        if bias is not None:
+            row.update(_bias_stats(bias))
+        return row
+
+    if args.stats and routers:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(16 if is_remote(args.path) else 1) as pool:
+            all_stats = list(pool.map(stats, routers))
+    else:
+        all_stats = [{} for _ in routers]
+    for router, extra in zip(routers, all_stats, strict=True):
+        out["routers"].append({**router.to_dict(), **extra})
     if not routers:
         out["notes"].append("No MoE router weights found (expected names ending in .gate/.router/.wg.weight)")
+    biased = [row for row in out["routers"] if "bias_bf16_merged_pairs" in row]
+    if biased:
+        worst = max(biased, key=lambda row: row["bias_bf16_merged_pairs"])
+        if worst["bias_bf16_merged_pairs"] > 0.01:
+            out["notes"].append(
+                f"Casting the correction bias to BF16 merges up to {worst['bias_bf16_merged_pairs']:.0%} of expert "
+                f"pairs (layer {worst['layer']}: {worst['bias_distinct']} distinct values -> "
+                f"{worst['bias_distinct_bf16']}); keep it in FP32")
+        ulp = max(row["bias_fp32_spacing"] for row in biased)
+        out["notes"].append(f"With FP32 selection keys, score differences below ~{ulp / 2:.1e} vanish when the bias is "
+                            "added; tokens whose top-k boundary is that close tie (check with "
+                            "routerlab.boundary_ties on real logits)")
     hashed = [r.layer for r in routers if r.hash_table]
     if hashed:
         out["notes"].append(f"Layers {hashed} use token-id hash routing (tid2eid); only their weights are learned")
@@ -170,6 +237,8 @@ def cmd_inspect(args) -> int:
         print(f"\n{'layer':>5}  {'shape':>13}  {'dtype':5}  {'corr. bias':10}  {'lin. bias':9}  weight")
         for r, row in zip(routers, out["routers"], strict=True):
             stats = (f"  |w|max {row['weight_abs_max']:.3g}" if "weight_abs_max" in row else "")
+            if "bias_min" in row:
+                stats += f"  bias [{row['bias_min']:.3g}, {row['bias_max']:.3g}]"
             print(f"{'-' if r.layer is None else r.layer:>5}  {str([r.num_experts, r.hidden_size]):>13}  "
                   f"{r.dtype:5}  {'yes' if r.correction_bias else 'no':10}  {'yes' if r.linear_bias else 'no':9}"
                   f"  {r.weight}{stats}")
@@ -178,23 +247,53 @@ def cmd_inspect(args) -> int:
     return 0
 
 
+def _bias_stats(bias: np.ndarray) -> dict:
+    from .precision import quantize
+    bias = bias.astype(np.float64).reshape(-1)
+    as_bf16 = quantize(bias, "bf16")
+    same = as_bf16[:, None] == as_bf16[None, :]
+    distinct_before = bias[:, None] == bias[None, :]
+    pairs = np.triu_indices(len(bias), 1)
+    return {"bias_min": float(bias.min()), "bias_max": float(bias.max()),
+            "bias_distinct": int(len(np.unique(bias))), "bias_distinct_bf16": int(len(np.unique(as_bf16))),
+            # pairs with different FP32 biases that become equal in BF16
+            "bias_bf16_merged_pairs": float((same & ~distinct_before)[pairs].mean()) if len(bias) > 1 else 0.0,
+            # FP32 spacing at the bias magnitude: score differences below ~half of it vanish in fp32 adds
+            "bias_fp32_spacing": float(np.spacing(np.float32(np.abs(bias).max())))}
+
+
 def _pair_groups(ref, cand):
     common = [name for name in ref if name in cand]
     if not common and len(ref) == 1 and len(cand) == 1:
         return [(next(iter(ref)), next(iter(cand)))]
+    sliced = sorted((n for n in cand if _SLICE_INDEX.search(n)), key=lambda n: int(_SLICE_INDEX.search(n).group(1)))
+    if not common and sliced:
+        routers = sorted((n for n in ref if "logits" in ref[n] or "ids" in ref[n]), key=_layer_order)
+        if len(routers) != len(sliced):
+            raise SystemExit(f"Candidate has {len(sliced)} MoE layers but the reference has {len(routers)} routers; "
+                             "select matching routers with --layers")
+        return list(zip(routers, sliced, strict=True))
     if not common:
         raise SystemExit(f"No matching keys between reference ({sorted(ref)[:5]}) and candidate "
                          f"({sorted(cand)[:5]})")
     return [(name, name) for name in common]
 
 
+def _has_spec_args(args) -> bool:
+    return bool(args.config or args.spec_json or args.top_k)
+
+
 def cmd_compare(args) -> int:
-    ref_groups = group_arrays(load_arrays(args.reference))
-    cand_groups = group_arrays(load_arrays(args.candidate))
-    pairs = _pair_groups(ref_groups, cand_groups)
+    ref_arrays, ref_spec = _load_inputs(args.reference, args.recompute)
+    cand_arrays, _ = _load_inputs(args.candidate, False)
+    ref_groups, cand_groups = group_arrays(ref_arrays), group_arrays(cand_arrays)
     if args.layers:
         wanted = set(args.layers.split(","))
-        pairs = [p for p in pairs if p[0] in wanted]
+        ref_groups = {name: group for name, group in ref_groups.items()
+                      if name in wanted or str(_layer_order(name)[1]) in wanted and _layer_order(name)[0] == 0}
+        if not ref_groups:
+            raise SystemExit(f"--layers {args.layers} matched no reference routers")
+    pairs = _pair_groups(ref_groups, cand_groups)
     extra_bias = _single_array(args.bias) if args.bias else None
     tolerance = None if args.tolerance is None else float(args.tolerance)
     reports: dict[str, RoutingReport] = {}
@@ -208,7 +307,8 @@ def cmd_compare(args) -> int:
             continue
         num_experts = reference.shape[-1] if isinstance(reference, np.ndarray) else None
         if base_spec is None:
-            base_spec = _spec_from_args(args, num_experts)
+            base_spec = ref_spec if ref_spec is not None and not _has_spec_args(args) else \
+                _spec_from_args(args, num_experts)
         spec = base_spec
         bias = ref.get("bias", cand.get("bias", extra_bias))
         if bias is not None:
@@ -271,6 +371,9 @@ def cmd_sweep(args) -> int:
         records, captured_spec = load_capture(args.capture)
         spec = captured_spec
         for name, rec in records.items():
+            if rec.hidden_states is None:
+                raise SystemExit(f"{args.capture}: router {name} has no captured inputs (it was recorded with "
+                                 "inputs=False); a precision sweep needs the router inputs")
             jobs.append((name, rec.hidden_states, rec.weight, rec.correction_bias, rec.linear_bias))
     elif args.checkpoint:
         ckpt = Checkpoint(args.checkpoint)
@@ -365,9 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_inspect)
 
     p = sub.add_parser("compare", help="compare candidate router outputs with a reference",
-                       description="Inputs are .npy/.npz/.safetensors/.pt. Per router, provide float logits "
-                       "(key 'NAME' or 'NAME/logits') and/or 'NAME/topk_ids' (+ 'NAME/topk_weights'); "
-                       "'NAME/correction_bias' attaches a bias. The reference should contain logits.")
+                       description="Inputs are .npy/.npz/.safetensors/.pt or routerlab capture files. Per "
+                       "router, provide float logits (key 'NAME' or 'NAME/logits') and/or 'NAME/topk_ids' "
+                       "(+ 'NAME/topk_weights'); 'NAME/correction_bias' attaches a bias. A [tokens, layers, k] "
+                       "integer array (vLLM routed_experts) is split per MoE layer and matched to the "
+                       "reference routers in layer order. The reference should contain logits.")
     p.add_argument("reference")
     p.add_argument("candidate")
     _add_spec_args(p)
@@ -377,6 +482,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail-on", choices=["unexplained", "any", "never"], default="unexplained",
                    help="exit status 1 on unexplained flips (default), on any flip, or never")
     p.add_argument("--examples", type=int, default=5)
+    p.add_argument("--recompute", action="store_true",
+                   help="for a reference capture file: use exact float64 logits recomputed from its inputs")
     p.add_argument("--json", help="write full reports to this JSON file")
     p.set_defaults(func=cmd_compare)
 
@@ -414,7 +521,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args) or 0)
-    except (ValueError, FileNotFoundError, KeyError) as exc:
+    except (ValueError, KeyError, OSError) as exc:  # OSError covers missing files, HTTP and permission errors
         print(f"routerlab {args.command}: error: {exc}", file=sys.stderr)
         return 2
 

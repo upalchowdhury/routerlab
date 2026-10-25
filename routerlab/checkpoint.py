@@ -4,6 +4,9 @@ Includes a small, dependency-free safetensors reader/writer (BF16 and FP8
 tensors are decoded exactly to float32) and router discovery: finds every MoE
 gate/router weight, its expert-score correction bias, and its linear bias,
 across sharded checkpoints, reading only the bytes of the tensors requested.
+
+Checkpoints can be local directories/files or remote Hub repos
+(``hf://org/name[@revision]``), which are read by HTTP range requests.
 """
 
 from __future__ import annotations
@@ -13,12 +16,14 @@ import math
 import re
 import struct
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
 from .precision import quantize
+from .remote import hf_file, is_remote, parse_hf_uri
 from .routing import RouterSpec
 
 __all__ = ["SafetensorsFile", "save_safetensors", "Checkpoint", "RouterTensors"]
@@ -29,6 +34,7 @@ _NATIVE = {"F64": np.float64, "F32": np.float32, "F16": np.float16, "I64": np.in
 _STORAGE = {**_NATIVE, "BF16": np.uint16, "F8_E4M3": np.uint8, "F8_E5M2": np.uint8}
 _TO_TAG = {np.dtype(v).newbyteorder("<"): k for k, v in _NATIVE.items()}
 _MAX_HEADER = 100 * 1024 * 1024
+_SPECULATIVE_HEADER = 256 * 1024
 
 
 def _fp8_table(exponent_bits: int, mantissa_bits: int, finite_only: bool) -> np.ndarray:
@@ -51,19 +57,45 @@ def _fp8_table(exponent_bits: int, mantissa_bits: int, finite_only: bool) -> np.
 _FP8_TABLES = {"F8_E4M3": _fp8_table(4, 3, True), "F8_E5M2": _fp8_table(5, 2, False)}
 
 
-class SafetensorsFile:
-    """Lazy reader for one .safetensors file; reads only the tensors you ask for."""
-
+class _LocalFile:
     def __init__(self, path):
         self.path = Path(path)
+        self.name = str(self.path)
+
+    def read(self, offset: int, length: int) -> bytes:
         with open(self.path, "rb") as handle:
-            prefix = handle.read(8)
-            if len(prefix) != 8:
-                raise ValueError(f"{self.path} is not a safetensors file (truncated header)")
-            (length,) = struct.unpack("<Q", prefix)
-            if length > _MAX_HEADER:
-                raise ValueError(f"{self.path}: implausible header length {length}")
-            header = json.loads(handle.read(length))
+            handle.seek(offset)
+            return handle.read(length)
+
+    read_upto = read
+
+
+class SafetensorsFile:
+    """Lazy reader for one .safetensors file; reads only the tensors you ask for.
+
+    `path` is a local path or any object with ``read(offset, length) -> bytes``
+    (e.g. `routerlab.remote.RemoteFile`)."""
+
+    def __init__(self, path):
+        self._source = path if hasattr(path, "read") else _LocalFile(path)
+        self.path = getattr(self._source, "path", self._source.name)
+        # One speculative read usually covers the whole header (one round trip when remote).
+        reader = getattr(self._source, "read_upto", self._source.read)
+        head = reader(0, _SPECULATIVE_HEADER)
+        if len(head) < 8:
+            raise ValueError(f"{self.path} is not a safetensors file (truncated header)")
+        (length,) = struct.unpack("<Q", head[:8])
+        if length > _MAX_HEADER:
+            raise ValueError(f"{self.path}: implausible header length {length}")
+        raw_header = head[8:8 + length]
+        if len(raw_header) < length:
+            raw_header += self._source.read(8 + len(raw_header), length - len(raw_header))
+        try:
+            header = json.loads(raw_header)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{self.path} is not a safetensors file (bad header)") from exc
+        if not isinstance(header, dict):
+            raise ValueError(f"{self.path} is not a safetensors file (bad header)")
         self.metadata: dict[str, str] = header.pop("__metadata__", None) or {}
         self._entries: dict[str, dict] = header
         self._data_start = 8 + length
@@ -91,7 +123,10 @@ class SafetensorsFile:
         count = math.prod(entry["shape"])
         if end - begin != count * storage.itemsize:
             raise ValueError(f"{name}: byte range does not match shape {entry['shape']} and dtype {tag}")
-        raw = np.fromfile(self.path, dtype=storage, count=count, offset=self._data_start + begin)
+        data = self._source.read(self._data_start + begin, end - begin)
+        if len(data) != end - begin:
+            raise ValueError(f"{name}: file is truncated")
+        raw = np.frombuffer(data, dtype=storage)
         if tag == "BF16":
             raw = (raw.astype(np.uint32) << 16).view(np.float32)
         elif tag in _FP8_TABLES:
@@ -155,11 +190,25 @@ _ROUTER_NAMES = ("gate", "router", "wg")
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
+def _is_router_weight_name(name: str) -> bool:
+    """`...gate.weight`, `...router.weight`, `...wg.weight`, or Granite's `...router.layer.weight`."""
+    if not name.endswith(".weight"):
+        return False
+    parts = name[: -len(".weight")].split(".")
+    return parts[-1] in _ROUTER_NAMES or parts[-2:] == ["router", "layer"]
+
+
 class Checkpoint:
     """A HuggingFace-style checkpoint: a directory (config.json + safetensors shards,
-    optionally with model.safetensors.index.json) or a single .safetensors file."""
+    optionally with model.safetensors.index.json), a single .safetensors file, or a
+    Hub repo ``hf://org/name[@revision]`` read remotely by byte ranges."""
 
     def __init__(self, path):
+        self._files: dict = {}
+        self._where: dict = {}
+        if is_remote(path):
+            self._init_remote(str(path))
+            return
         path = Path(path)
         if path.is_file():
             root, files = path.parent, [path]
@@ -173,8 +222,7 @@ class Checkpoint:
         self.root = root
         config_path = root / "config.json"
         self.config: dict | None = json.loads(config_path.read_text()) if config_path.is_file() else None
-        self._files: dict[Path, SafetensorsFile] = {}
-        self._where: dict[str, Path] = {}
+        self._repo = None
         index = root / "model.safetensors.index.json"
         if path.is_dir() and index.is_file():
             for name, filename in json.loads(index.read_text())["weight_map"].items():
@@ -184,10 +232,38 @@ class Checkpoint:
                 for name in self._open(file).keys():
                     self._where[name] = file
 
-    def _open(self, file: Path) -> SafetensorsFile:
+    def _init_remote(self, uri: str) -> None:
+        self._repo, self._revision = parse_hf_uri(uri)
+        self.root = uri
+
+        def fetch_json(filename):
+            try:
+                return json.loads(hf_file(self._repo, filename, self._revision).read_all())
+            except FileNotFoundError:
+                return None
+
+        self.config = fetch_json("config.json")
+        index = fetch_json("model.safetensors.index.json")
+        if index is not None:
+            self._where = dict(index["weight_map"])
+        else:
+            for name in self._open("model.safetensors").keys():
+                self._where[name] = "model.safetensors"
+
+    def _open(self, file) -> SafetensorsFile:
         if file not in self._files:
-            self._files[file] = SafetensorsFile(file)
+            source = hf_file(self._repo, file, self._revision) if self._repo else file
+            self._files[file] = SafetensorsFile(source)
         return self._files[file]
+
+    def _prefetch(self, names) -> None:
+        """Open the shards holding `names` concurrently (remote headers are round trips)."""
+        files = {self._where[n] for n in names if n in self._where} - set(self._files)
+        if self._repo and len(files) > 1:
+            with ThreadPoolExecutor(min(32, len(files))) as pool:
+                for file, opened in zip(files, pool.map(lambda f: SafetensorsFile(
+                        hf_file(self._repo, f, self._revision)), files), strict=True):
+                    self._files[file] = opened
 
     def names(self) -> list[str]:
         return list(self._where)
@@ -248,14 +324,10 @@ class Checkpoint:
         except ValueError:
             uses_bias = None
         found = []
-        for name in self._where:
-            if not name.endswith(".weight"):
-                continue
+        candidates = [name for name in self._where if _is_router_weight_name(name)]
+        self._prefetch(candidates)
+        for name in candidates:
             module = name[: -len(".weight")]
-            parts = module.split(".")
-            # gate / router / wg, or Granite's router.layer
-            if parts[-1] not in _ROUTER_NAMES and parts[-2:] != ["router", "layer"]:
-                continue
             dtype, shape = self.info(name)
             if len(shape) != 2 or shape[0] < 2:
                 continue

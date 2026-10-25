@@ -144,3 +144,14 @@ def test_accepts_torch_bf16_tensors():
     logits = torch.randn(5, 8).bfloat16()
     expected = route(logits.float().numpy(), RouterSpec(top_k=2))
     np.testing.assert_array_equal(route(logits, RouterSpec(top_k=2)).expert_ids, expected.expert_ids)
+
+
+def test_renormalized_weights_survive_score_underflow():
+    # sigmoid(-800) == 0.0 in float64; the renormalized weights are still well defined.
+    logits = np.array([[-800.0, -801.0, -900.0]])
+    weights = route(logits, RouterSpec(top_k=2, scoring="sigmoid", renormalize=True)).weights[0]
+    np.testing.assert_allclose(weights, [1 / (1 + np.exp(-1)), np.exp(-1) / (1 + np.exp(-1))])
+    for scoring in ("sigmoid", "sqrtsoftplus", "softmax"):
+        out = route(np.array([[-2000.0, -2001.0, 0.0]]) if scoring == "softmax" else logits,
+                    RouterSpec(top_k=2, scoring=scoring, renormalize=True)).weights
+        assert np.isfinite(out).all()

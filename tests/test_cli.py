@@ -167,3 +167,52 @@ def test_sweep_bias_flag_and_config_parsing(tmp_path, capsys):
     assert "| a |" in out and "| b |" in out
     with pytest.raises(SystemExit, match="cannot parse"):
         main(["sweep", cap, "--bias", str(tmp_path / "bias.npy"), "--configs", "name=a,weight=bf16"])
+
+
+def test_compare_vllm_routed_experts_and_capture_files(tmp_path, capsys):
+    rng = np.random.default_rng(7)
+    spec = RouterSpec(top_k=2, renormalize=True, num_experts=8, name="mixtral-like")
+    ref, ids = {}, []
+    for layer in (1, 2, 3):
+        logits = rng.normal(size=(50, 8))
+        ref[f"model.layers.{layer}.mlp.gate/logits"] = logits
+        ids.append(route(logits, spec).expert_ids)
+    routed = np.stack(ids, axis=1).astype(np.uint8)  # [tokens, layers, k], as vLLM returns it
+    np.savez(tmp_path / "trainer.npz", **ref)
+    np.save(tmp_path / "routed_experts.npy", routed)
+    args = ["compare", str(tmp_path / "trainer.npz"), str(tmp_path / "routed_experts.npy"), "--top-k", "2",
+            "--renormalize", "--tolerance", "1e-6"]
+    assert main(args) == 0
+    assert "| model.layers.3.mlp.gate | 50 | 0 |" in capsys.readouterr().out
+    routed[:, 2, :] = route(rng.normal(size=(50, 8)), spec).expert_ids  # last layer routed from wrong logits
+    np.save(tmp_path / "routed_experts.npy", routed)
+    assert main(args) == 1
+    capsys.readouterr()
+    assert main([*args, "--layers", "1,2,3"]) == 1
+    with pytest.raises(SystemExit, match="3 MoE layers but the reference has 2"):
+        main([*args, "--layers", "1,2"])
+
+    # Capture files compare directly; the spec comes from the capture metadata.
+    records = {f"model.layers.{i}.mlp.gate": CapturedRouter(
+        name=f"model.layers.{i}.mlp.gate", hidden_states=rng.normal(size=(40, H)).astype(np.float32),
+        weight=rng.normal(size=(8, H)).astype(np.float32), correction_bias=None, linear_bias=None,
+        hidden_dtype="float32", weight_dtype="float32") for i in (1, 2)}
+    save_capture(tmp_path / "a.safetensors", records, spec=spec)
+    save_capture(tmp_path / "b.safetensors", records, spec=spec)
+    capsys.readouterr()
+    assert main(["compare", str(tmp_path / "a.safetensors"), str(tmp_path / "b.safetensors")]) == 0
+    assert "| model.layers.2.mlp.gate | 40 | 0 |" in capsys.readouterr().out
+
+
+def test_vllm_layers_pair_in_natural_order(tmp_path):
+    rng = np.random.default_rng(8)
+    spec = RouterSpec(top_k=2, num_experts=8)
+    ref, ids = {}, []
+    for layer in range(12):  # names without 'layers.N': 'layer10' must not sort before 'layer2'
+        logits = rng.normal(size=(30, 8))
+        ref[f"layer{layer}/logits"] = logits
+        ids.append(route(logits, spec).expert_ids)
+    np.savez(tmp_path / "ref.npz", **ref)
+    np.save(tmp_path / "routed.npy", np.stack(ids, axis=1).astype(np.uint8))
+    assert main(["compare", str(tmp_path / "ref.npz"), str(tmp_path / "routed.npy"), "--top-k", "2",
+                 "--tolerance", "1e-9"]) == 0

@@ -75,8 +75,11 @@ def _bounds(logits: np.ndarray, spec: RouterSpec, err: np.ndarray):
         # per-element bounds (not jointly attainable, hence conservative across experts).
         c = b.max(axis=1, keepdims=True)
         ea, eb = np.exp(a - c), np.exp(b - c)
-        hi = eb / (eb + _sum_of_others(ea))
-        lo = ea / (ea + _sum_of_others(eb))
+        with np.errstate(invalid="ignore"):
+            hi = eb / (eb + _sum_of_others(ea))
+            lo = ea / (ea + _sum_of_others(eb))
+        # 0/0 when everything underflows at enormous errors: [0, 1] is always a valid bound.
+        hi, lo = np.where(np.isnan(hi), 1.0, hi), np.where(np.isnan(lo), 0.0, lo)
         ulps = 16.0 + logits.shape[1]  # covers the row sums' rounding (worst case grows with E)
     else:
         f = score_function(spec.scoring)  # elementwise and increasing
@@ -207,19 +210,25 @@ def _radius(logits: np.ndarray, spec: RouterSpec, rtol: float) -> np.ndarray:
     if rows.size == 0:
         return radius
     # Start from a rigorous lower bound, then grow the upper end until certification fails.
+    # The bound can be astronomically small (softmax probability gaps of e^-90), so the
+    # bracket starts at the logit scale rather than at a multiple of it.
+    scale = max(1.0, float(np.ptp(logits)))
     lo = _radius_lower_bound(logits[rows], ids[rows], None if group_mask is None else group_mask[rows], spec)
     lo = np.where(np.isfinite(lo) & ok(rows, np.where(np.isfinite(lo), lo, 0.0)), lo, 0.0)
-    hi = np.where(lo > 0, 2 * lo, max(1.0, float(np.ptp(logits))))
+    lo = np.minimum(lo, 1e8 * scale)
+    hi = np.maximum(2 * lo, 1e-3 * scale)
     growing = np.ones(rows.size, dtype=bool)
-    for _ in range(128):
-        idx = np.flatnonzero(growing)
+    while True:
+        idx = np.flatnonzero(growing & (hi <= 1e8 * scale))
         if idx.size == 0:
             break
         still = ok(rows[idx], hi[idx])
         lo[idx[still]] = hi[idx[still]]
-        hi[idx[still]] *= 2
+        hi[idx[still]] *= 4
         growing[idx[~still]] = False
-    never = growing  # still certified at an enormous error: the selection cannot change
+    # Certified even at 1e8 x the logit range: only a bias gap larger than the score range
+    # can do that, and certification is monotone in the error, so the set never changes.
+    never = growing
     active = ~never
     for _ in range(200):
         idx = np.flatnonzero(active)

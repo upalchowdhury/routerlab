@@ -54,6 +54,19 @@ def _sqrtsoftplus(x: np.ndarray) -> np.ndarray:
 _SCORE_FUNCTIONS = {"softmax": _softmax, "sigmoid": _sigmoid, "sqrtsoftplus": _sqrtsoftplus}
 
 
+def _log_score(name: str, x: np.ndarray) -> np.ndarray:
+    """log of the scoring function, finite for every finite logit."""
+    if name == "softmax":
+        shifted = x - x.max(axis=-1, keepdims=True)
+        return shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
+    softplus_neg = np.log1p(np.exp(-np.abs(x))) + np.maximum(-x, 0.0)  # softplus(-x)
+    if name == "sigmoid":
+        return -softplus_neg
+    softplus = softplus_neg + x                                         # softplus(x) = softplus(-x) + x
+    with np.errstate(divide="ignore"):
+        return 0.5 * np.where(x < -30, x, np.log(np.maximum(softplus, np.finfo(float).tiny)))
+
+
 def score_function(name: str):
     """Return the float64 NumPy implementation of a scoring function."""
     try:
@@ -303,7 +316,15 @@ def route(logits, spec: RouterSpec) -> Routing:
     if spec.renormalize:
         total = weights.sum(axis=1, keepdims=True)
         total = np.maximum(total, spec.renorm_min) if spec.renorm_min is not None else total + spec.renorm_eps
-        weights = weights / total
+        with np.errstate(invalid="ignore"):
+            weights = weights / total
+        underflow = (total == 0).reshape(-1)
+        if underflow.any():
+            # Every selected score underflowed (e.g. sigmoid(-800) == 0.0); the true ratio is
+            # well defined, so compute it in log space.
+            logs = np.take_along_axis(_log_score(spec.scoring, logits[underflow]), ids[underflow], axis=1)
+            logs = np.exp(logs - logs.max(axis=1, keepdims=True))
+            weights[underflow] = logs / logs.sum(axis=1, keepdims=True)
     return Routing(ids, weights * spec.scaling_factor, logits.shape[1])
 
 

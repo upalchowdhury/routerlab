@@ -1,6 +1,6 @@
 # Validation status
 
-This records what has been checked, how, and what has not. Updated October 25, 2026 (v0.2.0).
+This records what has been checked, how, and what has not. Updated October 25, 2026 (v0.3.0).
 
 ## Verified (CPU)
 
@@ -8,13 +8,25 @@ Environment: macOS (Apple silicon), Python 3.12.12, NumPy 2.5.4, PyTorch 2.14.1 
 transformers 5.20.2, ml_dtypes 0.5.4, safetensors 0.6.0. CI repeats the checks on Linux and macOS
 across Python 3.10–3.13 and NumPy 1.24–2.x.
 
-- **Test suite:** 175 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`.
+- **Test suite:** 194 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`. Property-based
+  tests (Hypothesis) were also run at 3,000 examples per property with three seeds. One soundness bug
+  (an infinite radius) was found and fixed.
+- **Real models, real text:** OLMoE-1B-7B and LFM2-8B-A1B on 16,384 WikiText-2 tokens. The workflow
+  covers FP32 and BF16 runs on CPU and BF16 runs on Apple MPS, capture of router inputs and logits,
+  sweeps, end-to-end and batch-invariance comparisons, and tie detection. Results are in
+  `docs/case-studies/`. These runs found and fixed the MPS float64 conversion bug.
+- **Real checkpoints, remote:** `inspect hf://...` on DeepSeek-V3 (163 shards, 59 routers, ~10 s),
+  Kimi-K2-Instruct, GLM-4.5-Air, Qwen3-30B-A3B and gpt-oss-20b, all without downloading the weights.
 - **Independent review:** a separate review pass, with no access to the author's reasoning,
   reported 21 defects, each reproduced. All are fixed and covered by regression tests, and each
   test was confirmed to fail on the pre-fix code. They included NaN weights passing, a vacuous
   verdict without a tolerance, an ambiguous 1-D tolerance shape, softmax bound cancellation at
   logit gaps of about 40, a conservative group certificate, checkpoint naming for DeepSeek-V4 and
   Granite, Ernie bias capture, and config defaults.
+  A second independent review of the 0.3.0 additions stopped early on an API rate limit. Instead, the
+  author's own adversarial pass found and fixed four more issues: lexicographic layer pairing for
+  vLLM arrays, a confusing error for output-only captures, range handling for servers that ignore
+  Range, and CLI tracebacks on HTTP errors. Each has a regression test where applicable.
 - **Reference routers vs. `transformers`** (`tests/test_hf_parity.py`): 30 configurations across
   27 `model_type`s, plus a check that minimal `config.json`s resolve to the same defaults as the
   transformers config classes. Each one instantiates the model's own router module with random weights and

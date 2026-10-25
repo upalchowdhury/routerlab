@@ -130,3 +130,13 @@ def test_one_dimensional_tolerance_shapes():
     assert certify(logits, spec, np.array([[0], [0], [0], [0.5]])).tolist() == [True, True, True, False]
     assert certify(logits[:3], spec, np.array([0.0, 0.0, 2.0])).tolist() == [True, True, False]  # per token
     assert certify(logits[:3], spec, np.array([[0.1, 0.1, 0.1, 0.1]])).all()  # per expert
+
+
+def test_tiny_lower_bound_does_not_fake_an_infinite_radius():
+    # Found by Hypothesis: softmax probability gaps of ~e^-90 gave a slope-based lower bound
+    # ~1e-40, and bracket growth gave up long before the real radius (~1.6): radius was inf.
+    spec = RouterSpec(top_k=6).with_bias(np.zeros(10))
+    logits = np.array([[12.83, -17.13, 79.63, -48.26, 19.85, -4.30, -10.64, 31.99, -54.54, -29.54]])
+    radius = robustness_radius(logits, spec)[0]
+    assert np.isfinite(radius) and 0 < radius < 3.25  # 3.25 = exact logit-space radius (gap / 2)
+    assert certify(logits, spec, 0.999 * radius)[0] and not certify(logits, spec, 1.001 * radius)[0]

@@ -27,8 +27,8 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 torch = ["torch>=2.1"]
 gpu = ["torch>=2.8", "triton>=3.4; sys_platform == 'linux'"]
-test = ["pytest>=7"]
-dev = ["pytest>=7", "ml_dtypes>=0.3", "safetensors>=0.4", "ruff>=0.5"]
+test = ["pytest>=7", "hypothesis>=6"]
+dev = ["pytest>=7", "hypothesis>=6", "ml_dtypes>=0.3", "safetensors>=0.4", "ruff>=0.5"]
 
 [project.scripts]
 routerlab = "routerlab.cli:main"

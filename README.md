@@ -3,9 +3,38 @@
 [![CI](https://github.com/upalchowdhury/routerlab/actions/workflows/ci.yml/badge.svg)](https://github.com/upalchowdhury/routerlab/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-**Numerical auditing for mixture-of-experts routers.** RouterLab tells you whether two implementations of an MoE router (a fused kernel and a reference, an inference engine and a trainer, BF16 and FP32) select the same experts. When they don't, it tells you whether the difference is ordinary rounding at a near-tie or a real bug.
+**Find out whether your MoE router is wrong or just imprecise.** RouterLab checks whether two implementations of a mixture-of-experts router pick the same experts for every token and layer. It compares a fused kernel against the reference, an inference engine against the trainer, BF16 against FP32, or batch 1 against batch 64. When they disagree, it tells you whether each change is ordinary rounding at a near-tie or a real bug.
 
-From `routerlab demo`: a DeepSeek-V3-style router (synthetic data), checked against a candidate kernel with a porting bug. The bug is DeepSeek-V2's group rule and the correction bias leaking into the weights:
+## Why this matters
+
+A router makes a hard top-k decision on noisy numbers, so any numerical difference moves tokens near the boundary to other experts, and that compounds across layers. This shows up in real systems:
+
+- **Silent corruption.** In GLM-5.2-NVFP4, FP32 selection keys tied exactly at the top-8 boundary, and the routing kernel emitted NaN expert weights ([sglang#30989](https://github.com/sgl-project/sglang/issues/30989)).
+- **Bugs found late.** New routing methods in an FP8 MoE backend dropped DeepSeek-V2-Lite GSM8K to 1.6%. Only a nightly end-to-end eval caught it ([vllm#33532](https://github.com/vllm-project/vllm/issues/33532)).
+- **Precision choices argued on intuition.** Correction biases cast to BF16 and BF16 router outputs ([sglang#38695](https://github.com/sgl-project/sglang/issues/38695)). On DeepSeek-V3's real checkpoint, a BF16 cast of the bias merges 62% of expert pairs, leaving a median of 3 distinct values per layer.
+- **RL instability.** Routing mismatch between rollout engine and trainer destabilises MoE RL ([R3](https://arxiv.org/abs/2510.11370), [GSPO](https://arxiv.org/abs/2507.18071)).
+
+Measured with RouterLab on real models and real text ([case studies](docs/case-studies/README.md)):
+
+| | OLMoE-1B-7B | LFM2-8B-A1B |
+| --- | ---: | ---: |
+| BF16 router output vs exact, same inputs: token-layer routings that change experts | 0.71% | 2.43% |
+| FP8 router weights | 9.6% | 11.0% |
+| Whole model in BF16 vs FP32, worst layer | 6.8% | 27.8% |
+| Same tokens, batch 4 vs batch 1 (Apple GPU), worst layer | 5.2% | 15.6% |
+
+The standard checks miss this. Exact `topk_ids` comparisons are flaky, so they get loosened. "Logits match to 1e-3" says nothing about how many tokens that re-routes, and end-to-end evals find problems late without pointing at a cause. **[Full rationale, incidents and use cases →](docs/WHY.md)**
+
+## What it does
+
+- **Reference routers** for 29 MoE architectures (DeepSeek V2/V3/V4, Kimi, GLM, Qwen, Mixtral, Llama 4, GPT-OSS, …), built from `config.json` and tested side by side against the `transformers` implementations.
+- **A margin per token:** the largest logit error that cannot change its experts, rigorous even with group-limited routing and correction bias. A changed token is *explained* if its margin is within your error bound and *unexplained* (a bug) otherwise.
+- **Drop-in test assertion:** `assert_routing_close` for kernel tests. It's strict but not flaky: near-ties pass, bugs fail with token-level detail, and the tolerance comes from a rigorous FP32 error bound.
+- **Comparisons for anything you can dump:** logits or top-k ids from any engine, vLLM's `routed_experts`, or two runs captured from PyTorch.
+- **Precision tools:** bit-exact BF16/FP16/FP8 emulation, precision sweeps on real activations, and detection of exact top-k ties in engine precision.
+- **Checkpoint inspection without downloading:** `routerlab inspect hf://deepseek-ai/DeepSeek-V3 --stats` reads router weights and biases by HTTP range requests in seconds.
+
+From `routerlab demo`: a candidate kernel with a porting bug (DeepSeek-V2's group rule on a V3-style router, and the correction bias leaking into the weights) checked against the reference:
 
 ```text
 Router deepseek_v3-style (synthetic): 2048 tokens, top-8 of 64 experts
@@ -22,24 +51,7 @@ Router deepseek_v3-style (synthetic): 2048 tokens, top-8 of 64 experts
   FAIL
 ```
 
-The same comparison against correctly computed BF16 logits shows 12 changed tokens, all of them explained, and passes.
-
-It is a NumPy library plus a CLI. PyTorch is optional, and so are GPUs; everything except the CUDA benchmark runs on a laptop.
-
-## Why you might need it
-
-MoE routers choose experts with a hard top-k. A logit error of `1e-3` changes nothing for most tokens, but it flips the selection for tokens whose k-th and (k+1)-th scores are closer than that. That's routine, and it causes several recurring problems:
-
-- **Flaky kernel tests.** `assert torch.equal(topk_ids, ref_ids)` fails on random near-ties. Loosen it and real bugs slip through.
-- **"Is this a bug or precision?"** Your fused router disagrees with the reference on 0.4% of tokens. Is that BF16 rounding, or a wrong group rule or a dropped correction bias?
-- **Precision decisions.** Can this router's weights or logits be BF16 or FP8? How many tokens would change experts?
-- **Train/inference mismatch.** RL on MoE models is sensitive to the rollout engine and the trainer routing tokens differently. You need to measure how often that happens, per layer, and why.
-
-RouterLab answers these with three pieces:
-
-1. **Reference routers** for every major MoE family, built straight from a HuggingFace `config.json`. They are checked side by side against the router modules in `transformers` for 27 architectures.
-2. **Margin certificates.** For each token, RouterLab computes the largest logit error that cannot change its expert set (its *robustness radius*), including group-limited selection and correction bias. A token that flips with a radius below your error bound is explained. One that flips with a radius above it is a bug.
-3. **Tolerance-aware tools** built on those certificates: an assertion for test suites, a comparison report, rigorous floating-point error bounds for the projection, bit-exact BF16/FP16/FP8 emulation, a precision sweep, checkpoint inspection, and activation capture from PyTorch models.
+The same comparison against correctly computed BF16 logits shows 12 changed tokens, all explained, and passes. RouterLab is a NumPy library plus a CLI; PyTorch and GPUs are optional.
 
 ## Install
 
@@ -97,9 +109,9 @@ AssertionError: Routing mismatch for 'deepseek_v3-style (synthetic)' (2048 token
 
 It also checks logits against the tolerance (when the candidate provides logits), rejects duplicate experts and non-finite weights, and checks weights of unchanged tokens against a bound derived from the tolerance. Use `weight_rtol=2**-8` if the engine returns BF16 weights.
 
-### 3. Compare dumps from two systems
+### 3. Compare two systems
 
-Save router logits (or `topk_ids`/`topk_weights`) from each system, one key per layer, as `.npz`, `.safetensors`, `.npy` or `.pt`:
+**Any engine:** save router logits (or `topk_ids`/`topk_weights`) from each system, one key per layer, as `.npz`, `.safetensors`, `.npy` or `.pt`:
 
 ```bash
 routerlab compare trainer.npz engine.npz --config config.json --tolerance 2e-2 --json report.json
@@ -121,7 +133,25 @@ Key conventions: use `NAME` or `NAME/logits` for float logits, `NAME/topk_ids` w
 
 Exit status 1 means some layer FAILED (unexplained flips, invalid selections, or out-of-tolerance logits or weights) or is UNCHECKED: it differs, but no `--tolerance` was given to judge it. `--fail-on any` also fails on explained flips; `--fail-on never` always exits 0.
 
-Per token, the report gives the logit error, set changes, moved routing weight, the radius distribution, how many tokens are at risk under the tolerance, explained vs. unexplained flips with examples, and per-expert load shift.
+Per token, the report gives the logit error, set changes, moved routing weight, the radius distribution, how many tokens are at risk under the tolerance, explained vs. unexplained flips with examples, exact top-k ties in FP32/BF16 selection keys, and per-expert load shift.
+
+**vLLM rollouts vs your trainer (RL):** with `enable_return_routed_experts=True`, vLLM returns `routed_experts` with shape `[tokens, moe_layers, top_k]`. Save it as `.npy` and compare it against the trainer's router logits for the same token positions. Layers are matched in order:
+
+```bash
+routerlab compare trainer_logits.npz routed_experts.npy --config config.json --tolerance 1e-2
+```
+
+**Two PyTorch runs** (FP32 vs BF16, batch 1 vs batch 64, CPU vs GPU, before vs after a kernel change): capture each run, then compare the captures directly. Each run's own router logits are used, and the router spec comes from the capture:
+
+```python
+with RouterCapture(model) as capture:   # records router inputs and the logits each router computed
+    model(**batch)
+capture.save("run_a.safetensors")
+```
+
+```bash
+routerlab compare run_a.safetensors run_b.safetensors --tolerance 2e-2
+```
 
 ### 4. Decide a precision with real activations
 
@@ -142,25 +172,42 @@ routerlab sweep router_inputs.safetensors
 ```
 
 ```text
-| precision | max logit err | tokens changed | changed % | moved weight (mean) | max load shift |
-|---|---:|---:|---:|---:|---:|
-| fp32 math on stored values | 9.85e-07 | 0 | 0.000 | 4.86e-08 | 0 |
-| fp32 math, bf16 logits | 7.80e-03 | 42 | 2.051 | 2.62e-03 | 3 |
-| fp16 operands, fp16 logits | 9.75e-04 | 5 | 0.244 | 3.44e-04 | 1 |
-| fp8-e4m3 weights (per-channel scale) | 9.12e-02 | 355 | 17.334 | 2.23e-02 | 13 |
+## model.layers.7.mlp.gate
+Router olmoe, 4096 tokens. Reference margin (logit units): p1 3.093e-04, p5 1.970e-03, p50 2.783e-02
+
+| precision | max logit err | tokens changed | changed % | moved weight (mean) | max load shift | fp32-key ties |
+|---|---:|---:|---:|---:|---:|---:|
+| fp32 math on stored values | 1.24e-05 | 0 | 0.000 | 1.06e-07 | 0 | 0 |
+| fp32 math, bf16 logits | 1.55e-02 | 24 | 0.586 | 7.93e-04 | 4 | 51 |
+| bf16 operands, fp32 logits | 1.24e-05 | 0 | 0.000 | 1.06e-07 | 0 | 0 |
+| bf16 operands, bf16 logits | 1.55e-02 | 24 | 0.586 | 7.93e-04 | 4 | 51 |
+| fp16 operands, fp16 logits | 1.96e-03 | 2 | 0.049 | 8.47e-05 | 1 | 4 |
+| fp8-e4m3 weights (per-channel scale) | 8.48e-02 | 388 | 9.473 | 1.21e-02 | 38 | 0 |
 ```
 
-*(Above: a randomly initialised tiny Qwen3-MoE, illustrative only.)* Custom configurations look like `--configs "name=bf16 logits,input_format=fp32,weight_format=fp32,output_format=bf16;..."`.
+*(Above: real output, OLMoE-1B-7B run in BF16 on 4,096 WikiText-2 tokens, layer 7. The activations are already BF16, so the "bf16 operands" rows equal the FP32 rows. "fp32-key ties" counts tokens whose top-k boundary is an exact tie once the router logits are stored in that precision.)* Custom configurations look like `--configs "name=bf16 logits,input_format=fp32,weight_format=fp32,output_format=bf16;..."`.
 
 Without a capture, `routerlab sweep --checkpoint DIR --layer N --hidden hidden.npy` reads the router straight from a checkpoint. `--synthetic N` uses Gaussian inputs, scaled by the layer's `post_attention_layernorm` weight when there is one; these results are labelled as indicative only.
 
-### 5. Inspect a checkpoint without loading the model
+### 5. Inspect a checkpoint without downloading it
 
 ```bash
-routerlab inspect /models/DeepSeek-V3 --stats
+routerlab inspect hf://deepseek-ai/DeepSeek-V3 --stats     # or a local directory / .safetensors file
 ```
 
-This lists every router weight, its correction bias and linear bias, shapes and dtypes, magnitude stats, and whether FP32-stored weights are exactly BF16-representable. It reads only the bytes it needs from sharded safetensors, decodes BF16/FP8 exactly, and doesn't need torch.
+```text
+hf://deepseek-ai/DeepSeek-V3: 91991 tensors, 59 routers
+spec: deepseek_v3: sigmoid scoring, top-8 of 256 experts, group-limited (4 of 8 groups by top2_sum), correction bias (not attached), renormalized, scaled x2.5
+
+layer          shape  dtype  corr. bias  lin. bias  weight
+    3    [256, 7168]  BF16   yes         no         model.layers.3.mlp.gate.weight  |w|max 0.248  bias [4.95, 4.96]
+  ...
+   61    [256, 7168]  BF16   yes         no         model.layers.61.mlp.gate.weight  |w|max 0.324  bias [3.7, 3.88]
+note: Casting the correction bias to BF16 merges up to 94% of expert pairs (layer 51: 38 distinct values -> 2); keep it in FP32
+note: With FP32 selection keys, score differences below ~4.8e-07 vanish when the bias is added; ...
+```
+
+This lists every router weight with its correction bias and linear bias, shapes, dtypes and magnitude stats, plus warnings: bias values that BF16 cannot hold apart, the FP32 tie threshold, hash-routed layers, and FP32-stored weights that are exactly BF16-representable. It reads only the needed bytes over HTTP range requests (about 10 s for DeepSeek-V3's 163 shards), decodes BF16/FP8 exactly, and doesn't need torch. Gated models use `HF_TOKEN`, which is sent only to the Hub host and never to its CDN redirects.
 
 ## Supported routers
 
@@ -210,9 +257,10 @@ The property tests in `tests/test_certify.py` check soundness for every family u
 | `assert_routing_close` | test assertion |
 | `project`, `projection_error_bound` | projection with precision emulation; rigorous/probabilistic error bounds |
 | `quantize`, `quantize_scaled`, `FORMATS`, `is_representable` | bit-exact BF16/FP16/TF32/FP8-E4M3/FP8-E5M2 casts (RNE, subnormals, overflow modes) |
+| `selection_keys`, `boundary_ties` | selection keys in engine precision (FP32/BF16); tokens with exact ties at the top-k or group boundary |
 | `precision_sweep`, `PrecisionConfig` | what-if over precision configurations |
-| `Checkpoint`, `SafetensorsFile`, `save_safetensors` | router discovery and dependency-free safetensors I/O |
-| `routerlab.capture.RouterCapture`, `load_capture` | activation capture from PyTorch models |
+| `Checkpoint`, `SafetensorsFile`, `save_safetensors` | router discovery and dependency-free safetensors I/O, local or `hf://org/model` (HTTP range reads) |
+| `routerlab.capture.RouterCapture`, `load_capture` | capture router inputs and the logits each router computed, from any PyTorch model (CPU, CUDA, MPS) |
 
 ## Precision and scope notes
 

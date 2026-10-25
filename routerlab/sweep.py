@@ -16,6 +16,7 @@ import numpy as np
 
 from .certify import robustness_radius
 from .compare import RoutingReport, _jsonable, compare_routing
+from .keys import boundary_ties
 from .precision import quantize
 from .projection import project
 from .routing import RouterSpec
@@ -66,7 +67,8 @@ class SweepResult:
             "reference_radius_quantiles": self.radius_quantiles,
             "zero_margin_tokens": self.zero_margin_tokens,
             "configs": [{"config": row["config"].to_dict(),
-                         **({"report": row["report"].to_dict()} if "report" in row else {"error": row["error"]})}
+                         **({"report": row["report"].to_dict(), "fp32_key_ties": row["ties"]}
+                            if "report" in row else {"error": row["error"]})}
                         for row in self.rows]})
 
     def table(self) -> str:
@@ -74,15 +76,16 @@ class SweepResult:
                  + ", ".join(f"{k} {v:.3e}" for k, v in self.radius_quantiles.items())
                  + (f"; {self.zero_margin_tokens} exact ties" if self.zero_margin_tokens else ""), "",
                  "| precision | max logit err | tokens changed | changed % | moved weight (mean) | "
-                 "max load shift |", "|---|---:|---:|---:|---:|---:|"]
+                 "max load shift | fp32-key ties |", "|---|---:|---:|---:|---:|---:|---:|"]
         for row in self.rows:
             name = row["config"].name
             if "error" in row:
-                lines.append(f"| {name} | {row['error']} | | | | |")
+                lines.append(f"| {name} | {row['error']} | | | | | |")
                 continue
             r = row["report"]
             lines.append(f"| {name} | {r.logit_max_abs_error:.2e} | {r.mismatched_tokens} | "
-                         f"{100 * r.mismatch_rate:.3f} | {r.moved_weight_mean:.2e} | {r.max_load_shift} |")
+                         f"{100 * r.mismatch_rate:.3f} | {r.moved_weight_mean:.2e} | {r.max_load_shift} | "
+                         f"{row['ties']} |")
         return "\n".join(lines)
 
 
@@ -110,5 +113,6 @@ def precision_sweep(hidden, weight, spec: RouterSpec, configs: Iterable[Precisio
         except (FloatingPointError, ValueError) as exc:
             result.rows.append({"config": config, "error": str(exc)})
             continue
-        result.rows.append({"config": config, "report": compare_routing(reference, logits, spec)})
+        result.rows.append({"config": config, "ties": int(boundary_ties(logits, spec, "fp32").sum()),
+                            "report": compare_routing(reference, logits, spec, key_precisions=())})
     return result

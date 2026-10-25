@@ -22,6 +22,7 @@ import numpy as np
 
 from ._arrays import as_float64_2d, broadcast_bound, to_numpy
 from .certify import certify, robustness_radius
+from .keys import boundary_ties
 from .routing import RouterSpec, Routing, route
 
 __all__ = ["RoutingReport", "compare_routing", "as_routing", "format_reports"]
@@ -99,6 +100,9 @@ class RoutingReport:
     explained_mismatches: int | None = None
     unexplained_mismatches: int | None = None
     max_mismatch_radius: float | None = None
+    # Exact ties at the selection boundary when keys are computed in engine precision
+    # (e.g. {"fp32": 3, "bf16": 410}); such tokens route by kernel tie-breaking.
+    boundary_ties: dict[str, int] | None = None
     # Expert load
     max_load_shift: int = 0
     max_load_shift_expert: int | None = None
@@ -171,6 +175,10 @@ class RoutingReport:
                          + ("" if self.radius_quantiles is not None else "; needs reference logits"))
         if self.max_mismatch_radius is not None and self.mismatched_tokens:
             lines.append(f"  largest margin among changed tokens: {self.max_mismatch_radius:.3e}")
+        if self.boundary_ties and any(self.boundary_ties.values()):
+            ties = ", ".join(f"{n} with {p} keys" for p, n in self.boundary_ties.items())
+            lines.append(f"  ties        reference tokens tied at the top-k boundary: {ties} "
+                         "(engines computing keys in that precision route them by tie-breaking)")
         if self.max_load_shift:
             lines.append(f"  load        largest per-expert change {self.max_load_shift} tokens "
                          f"(expert {self.max_load_shift_expert})")
@@ -200,7 +208,7 @@ def _jsonable(value):
 
 def compare_routing(reference, candidate, spec: RouterSpec, *, tolerance=None,
                     weight_atol: float = 1e-6, weight_rtol: float = 1e-5,
-                    max_examples: int = 20) -> RoutingReport:
+                    key_precisions=("fp32", "bf16"), max_examples: int = 20) -> RoutingReport:
     """Compare `candidate` against `reference` under router `spec`.
 
     Parameters
@@ -224,6 +232,9 @@ def compare_routing(reference, candidate, spec: RouterSpec, *, tolerance=None,
         ``w * (exp(2 * tol_row) - 1 + weight_rtol) + weight_atol``, where the
         first term bounds how far the logit tolerance can move any supported
         router's weights. Use ``weight_rtol=2**-8`` for BF16 weights.
+    key_precisions:
+        Precisions in which to look for exact ties at the selection boundary of
+        the reference logits (see `routerlab.keys.boundary_ties`); () to skip.
     """
     ref_logits = cand_logits = None
     if _is_logits(reference):
@@ -298,6 +309,8 @@ def compare_routing(reference, candidate, spec: RouterSpec, *, tolerance=None,
                                    if finite.size else {"p1": np.inf, "p5": np.inf, "p50": np.inf})
         if changed.any():
             report.max_mismatch_radius = float(radius[changed].max())
+        if key_precisions:
+            report.boundary_ties = {str(p): int(boundary_ties(ref_logits, spec, p).sum()) for p in key_precisions}
     unexplained = np.zeros(ref.num_tokens, dtype=bool)
     if tol is not None:
         safe = certify(ref_logits, spec, tol)

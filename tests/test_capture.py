@@ -66,6 +66,7 @@ def test_capture_records_router_inputs(model_type, tmp_path):
         logits = (out[2] if model_type.startswith("granite") else out[0]).double().numpy()
         np.testing.assert_allclose(project(rec.hidden_states, rec.weight, rec.linear_bias), logits,
                                    rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(rec.logits, logits, rtol=1e-6, atol=1e-6)  # captured module output
 
     capture.save(tmp_path / "cap.safetensors")
     loaded, saved_spec = load_capture(tmp_path / "cap.safetensors")
@@ -132,3 +133,51 @@ def test_ernie_bias_under_the_router_and_float64_models(tmp_path):
     for name, rec in capture.records().items():
         assert rec.hidden_states.dtype == np.float64
         np.testing.assert_array_equal(loaded[name].hidden_states, rec.hidden_states)
+
+
+def test_output_capture_picks_logits_not_scores():
+    import torch
+
+    class ScoresFirst(torch.nn.Module):  # like Llama4Router: returns (sigmoid scores, logits)
+        def __init__(self):
+            super().__init__()
+            self.router = torch.nn.Linear(16, 8, bias=False)
+
+        def forward(self, x):
+            logits = self.router(x)
+            return torch.sigmoid(logits), logits
+
+    model = torch.nn.Sequential(ScoresFirst())
+    x = torch.randn(6, 16)
+    with RouterCapture(model, modules=["0.router"]) as capture, torch.no_grad():
+        model(x)
+    rec = capture.records()["0.router"]
+    np.testing.assert_allclose(rec.logits, (x @ model[0].router.weight.T).detach().numpy(), rtol=1e-6)
+
+    class Wrapped(torch.nn.Module):  # a 'router' whose outputs are probabilities only
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(8, 16))
+
+        def forward(self, x):
+            return torch.softmax(x @ self.weight.T, dim=-1)
+
+    model = torch.nn.Sequential()
+    model.add_module("router", Wrapped())
+    with RouterCapture(model) as capture, torch.no_grad():
+        model(torch.randn(6, 16) * 10)
+    assert capture.records()["router"].logits is None  # probabilities are not mistaken for logits
+
+
+@pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="requires torch")
+def test_capture_on_apple_mps_bf16():
+    import torch
+
+    if not torch.backends.mps.is_available():
+        pytest.skip("requires Apple MPS")
+    model = _model("mixtral", torch.bfloat16).to("mps")
+    with RouterCapture(model) as capture, torch.no_grad():
+        model(input_ids=torch.randint(0, 97, (2, 9), device="mps"))
+    for rec in capture.records().values():
+        assert rec.logits is not None  # identification must not use MPS float64 conversions
+        np.testing.assert_allclose(rec.logits, project(rec.hidden_states, rec.weight), rtol=0.02, atol=0.05)
