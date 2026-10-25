@@ -122,3 +122,9 @@ def test_quantize_scaled_per_channel():
     rel = np.abs(q - w).max(axis=1) / np.abs(w).max(axis=1)
     assert rel.max() <= 2 ** -4 + 1e-6  # within half an E4M3 ulp of each row's absmax
     assert np.isfinite(q).all()
+
+
+def test_fp8_aliases():
+    for name in ("fp8_e4m3", "fp8-e4m3", "float8_e4m3fn", "e4m3", "torch.float8_e4m3fn"):
+        assert resolve_format(name) is FORMATS["fp8_e4m3fn"]
+    assert resolve_format("fp8-e5m2") is FORMATS["fp8_e5m2"]

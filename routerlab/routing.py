@@ -321,6 +321,22 @@ _OTHER = {"deepseek_v2", "deepseek_v4", "llama4_text", "llama4", "ernie4_5_moe",
 SUPPORTED_MODEL_TYPES = tuple(sorted(_SOFTMAX_ALWAYS_RENORM | _SOFTMAX_CONFIG_RENORM | _SOFTMAX_NO_RENORM
                                      | _DEEPSEEK_V3_FAMILY | _OTHER))
 
+# Routing-semantics defaults of the transformers 5.x config classes, applied when a
+# config.json omits the key (tests/test_hf_parity.py checks them against transformers).
+_V3 = {"norm_topk_prob": True, "routed_scaling_factor": 2.5, "n_group": 8, "topk_group": 4}
+_FAMILY_DEFAULTS = {
+    "deepseek_v2": {"norm_topk_prob": False, "routed_scaling_factor": 1.0, "topk_method": "greedy"},
+    "deepseek_v3": _V3, "deepseek_v32": _V3, "kimi_k2": _V3,
+    "deepseek_v4": {"norm_topk_prob": True, "routed_scaling_factor": 1.5, "scoring_func": "sqrtsoftplus"},
+    "dots1": {"norm_topk_prob": False, "routed_scaling_factor": 1.0, "n_group": 1, "topk_group": 1},
+    "exaone_moe": {"norm_topk_prob": True, "routed_scaling_factor": 2.5, "n_group": 1, "topk_group": 1},
+    "glm4_moe": {"norm_topk_prob": True, "routed_scaling_factor": 1.0, "n_group": 1, "topk_group": 1},
+    "kimi_linear": {"norm_topk_prob": True, "routed_scaling_factor": 2.446, "n_group": 1, "topk_group": 1},
+    "lfm2_moe": {"norm_topk_prob": True, "routed_scaling_factor": 1.0, "use_expert_bias": True},
+    "ernie4_5_moe": {"moe_norm_min": 1e-12},
+    "qwen3_next": {"norm_topk_prob": True},
+}
+
 _EXPERT_KEYS = ("n_routed_experts", "num_local_experts", "num_experts", "moe_num_experts")
 _TOPK_KEYS = ("num_experts_per_tok", "moe_k", "experts_per_token", "moe_topk")
 
@@ -388,6 +404,7 @@ def _spec_from_hf_config(cfg: dict) -> RouterSpec:
         model_type = str(cfg.get("model_type") or model_type)
         if model_type == "llama4":
             model_type = "llama4_text"
+    cfg = {**_FAMILY_DEFAULTS.get(model_type, {}), **{k: v for k, v in cfg.items() if v is not None}}
     num_experts = _first(cfg, _EXPERT_KEYS)
     top_k = _first(cfg, _TOPK_KEYS)
     if isinstance(top_k, (list, tuple)):

@@ -142,3 +142,41 @@ def test_single_file_and_errors(tmp_path):
     (tmp_path / "bad.safetensors").write_bytes(b"\x01")
     with pytest.raises(ValueError):
         SafetensorsFile(tmp_path / "bad.safetensors")
+
+
+def test_deepseek_v4_and_granite_naming(tmp_path):
+    rng = np.random.default_rng(3)
+    e, h = 8, 12
+    v4 = tmp_path / "v4"
+    v4.mkdir()
+    (v4 / "config.json").write_text(json.dumps({"model_type": "deepseek_v4", "n_routed_experts": e,
+                                                "num_experts_per_tok": 2, "hidden_size": h}))
+    save_safetensors(v4 / "model.safetensors", {
+        "model.layers.0.ffn.gate.weight": rng.normal(size=(e, h)).astype(np.float32),
+        "model.layers.0.ffn.gate.tid2eid": np.zeros((97, 2), np.int64),
+        "model.layers.3.ffn.gate.weight": rng.normal(size=(e, h)).astype(np.float32),
+        "model.layers.3.ffn.gate.bias": rng.normal(size=e).astype(np.float32)})
+    routers = {r.layer: r for r in Checkpoint(v4).find_routers()}
+    assert routers[3].correction_bias == "model.layers.3.ffn.gate.bias" and routers[3].linear_bias is None
+    assert routers[0].hash_table == "model.layers.0.ffn.gate.tid2eid" and routers[3].hash_table is None
+
+    granite = tmp_path / "granite"
+    granite.mkdir()
+    (granite / "config.json").write_text(json.dumps({"model_type": "granitemoe", "num_local_experts": e,
+                                                     "num_experts_per_tok": 2, "hidden_size": h}))
+    save_safetensors(granite / "model.safetensors", {
+        "model.layers.0.block_sparse_moe.router.layer.weight": rng.normal(size=(e, h)).astype(np.float32)})
+    (router,) = Checkpoint(granite).find_routers()
+    assert router.layer == 0 and router.weight.endswith("router.layer.weight")
+
+
+def test_fp8_block_size_from_quantization_config(tmp_path):
+    root = tmp_path / "q"
+    root.mkdir()
+    weight = quantize(np.random.default_rng(4).normal(size=(100, 64)) * 10, "fp8_e4m3fn")
+    scale = np.array([[0.5], [2.0]], np.float32)  # 64x64 blocks -> 2 x 1 scales
+    (root / "config.json").write_text(json.dumps({"quantization_config": {"weight_block_size": [64, 64]}}))
+    _save_fp8(root / "model.safetensors", {"w.weight": weight, "w.weight_scale_inv": scale})
+    loaded = Checkpoint(root).load("w.weight")
+    np.testing.assert_array_equal(loaded[:64], weight[:64] * 0.5)
+    np.testing.assert_array_equal(loaded[64:], weight[64:] * 2.0)

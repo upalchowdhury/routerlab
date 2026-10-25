@@ -73,3 +73,14 @@ def test_linear_bias_and_scaled_fp8_weights():
 def test_overflow_is_reported():
     with pytest.raises(FloatingPointError):
         project(np.full((1, 4), 300.0), np.full((2, 4), 300.0), output_format="fp16")
+
+
+def test_bound_covers_underflow_and_bias_is_not_rounded_silently():
+    rng = np.random.default_rng(4)
+    x = rng.standard_normal((32, 256)).astype(np.float32) * np.float32(1e-22)
+    w = rng.standard_normal((16, 256)).astype(np.float32)
+    bound = projection_error_bound(x, w, accumulate="fp32")
+    assert (np.abs(project(x, w, accumulate="fp32") - project(x, w)) <= bound).all()
+    with pytest.raises(ValueError, match="linear_bias"):
+        project(x, w, np.full(16, 0.1), accumulate="fp32")
+    project(x, w, np.full(16, 0.5), accumulate="fp32")

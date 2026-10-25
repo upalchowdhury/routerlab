@@ -10,7 +10,7 @@ Forward pre-hooks record the hidden states that enter every router module
 (any module named ``gate``/``router``/``wg`` with a 2-D ``weight`` [E, H] that is
 not a dense MLP projection). Weights, correction bias, and linear bias are
 read from the modules when saving. Values are stored losslessly (BF16 stays
-BF16, everything else FP32).
+BF16, FP64 stays FP64, everything else FP32).
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 @dataclass
 class CapturedRouter:
     name: str
-    hidden_states: np.ndarray            # [N, H] float32 (exact copy of the captured values)
-    weight: np.ndarray                   # [E, H] float32
+    hidden_states: np.ndarray            # [N, H] float32 (float64 for float64 models): exact values
+    weight: np.ndarray                   # [E, H] float32 / float64
     correction_bias: np.ndarray | None   # [E]
     linear_bias: np.ndarray | None       # [E]
     hidden_dtype: str
@@ -48,6 +48,12 @@ class CapturedRouter:
     def layer(self) -> int | None:
         match = _LAYER_RE.search(self.name)
         return int(match.group(1)) if match else None
+
+
+def _exact(tensor) -> np.ndarray:
+    """float32 for <= 32-bit floats (exact for BF16/FP16), float64 kept as float64."""
+    array = to_numpy(tensor)
+    return array if array.dtype == np.float64 else array.astype(np.float32)
 
 
 def _weight_of(module):
@@ -79,7 +85,7 @@ def _find_bias(model, name: str, module, size: int):
     """Correction bias on the router, its parent block, or a sibling statistics module."""
     parent_name = name.rsplit(".", 1)[0] if "." in name else ""
     parent = model.get_submodule(parent_name) if parent_name else model
-    holders = [module, parent, getattr(parent, "moe_statics", None)]
+    holders = [module, getattr(module, "moe_statics", None), parent, getattr(parent, "moe_statics", None)]
     for holder in holders:
         for attr in _BIAS_ATTRS:
             value = getattr(holder, attr, None) if holder is not None else None
@@ -159,8 +165,7 @@ class RouterCapture:
             bias = _find_bias(self.model, name, module, weight.shape[0])
             linear = getattr(module, "bias", None)
             out[name] = CapturedRouter(
-                name=name, hidden_states=to_numpy(hidden).astype(np.float32),
-                weight=to_numpy(weight).astype(np.float32),
+                name=name, hidden_states=_exact(hidden), weight=_exact(weight),
                 correction_bias=None if bias is None else to_numpy(bias).astype(np.float32).reshape(-1),
                 linear_bias=None if linear is None or not hasattr(linear, "numel")
                 else to_numpy(linear).astype(np.float32).reshape(-1),
@@ -213,7 +218,7 @@ def load_capture(path) -> tuple[dict[str, CapturedRouter], RouterSpec | None]:
     spec = RouterSpec.from_dict(json.loads(file.metadata["router_spec"])) if "router_spec" in file.metadata else None
     def get(name, key):
         full = f"{name}/{key}"
-        return file.get(full).astype(np.float32) if full in file else None
+        return file.get(full) if full in file else None
 
     records = {}
     for name, dtypes in info.items():

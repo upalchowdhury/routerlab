@@ -8,9 +8,16 @@ Environment: macOS (Apple silicon), Python 3.12.12, NumPy 2.5.4, PyTorch 2.14.1 
 transformers 5.20.2, ml_dtypes 0.5.4, safetensors 0.6.0. CI repeats the checks on Linux and macOS
 across Python 3.10–3.13 and NumPy 1.24–2.x.
 
-- **Test suite:** 131 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`.
+- **Test suite:** 175 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`.
+- **Independent review:** a separate review pass, with no access to the author's reasoning,
+  reported 21 defects, each reproduced. All are fixed and covered by regression tests, and each
+  test was confirmed to fail on the pre-fix code. They included NaN weights passing, a vacuous
+  verdict without a tolerance, an ambiguous 1-D tolerance shape, softmax bound cancellation at
+  logit gaps of about 40, a conservative group certificate, checkpoint naming for DeepSeek-V4 and
+  Granite, Ernie bias capture, and config defaults.
 - **Reference routers vs. `transformers`** (`tests/test_hf_parity.py`): 30 configurations across
-  27 `model_type`s. Each one instantiates the model's own router module with random weights and
+  27 `model_type`s, plus a check that minimal `config.json`s resolve to the same defaults as the
+  transformers config classes. Each one instantiates the model's own router module with random weights and
   biases, then requires identical expert sets (except at genuine float32 near-ties, radius < 1e-5),
   weights within rtol 2e-5, and an identical spec from the live config object and its serialised
   dict. A mutation check (wrong group rule, dropped bias, wrong renormalization or scaling) makes
@@ -23,14 +30,14 @@ across Python 3.10–3.13 and NumPy 1.24–2.x.
   E4M3FN saturating, E5M2). Each probe covers every finite representable value, every rounding
   midpoint ±1 float32 ulp, 200k random float32 bit patterns, and the special values.
 - **Certificates** (`tests/test_certify.py`): radius soundness under random, uniform and corner
-  perturbations for 7 router families; exactness of the closed form for plain top-k;
-  agreement between bisection and `certify` within 0.1%.
+  perturbations for 7 router families and at large logit scales; exactness of the closed form for
+  plain top-k; agreement between bisection and `certify` within 0.1%.
 - **Error bounds** (`tests/test_projection.py`): the deterministic FP32 bound holds for BLAS,
   blocked (split-K-style) and sequential summation orders; the BF16/FP16 output-cast bounds hold.
 - **Packaging:** the built wheel installs and passes the suite on Python 3.10 with NumPy 1.24.4,
   and on Python 3.13 with NumPy 2.5.4, with optional dependencies absent.
 - **Performance** (one machine): 100k tokens × 256 experts with a DeepSeek-V3-style spec takes
-  about 0.8 s to route, 2.1 s for radii (8 threads; bisection) and 5.2 s for a full
+  about 0.8 s to route, 2.2 s for radii (8 threads; bisection) and 5.2 s for a full
   `compare_routing`. Plain softmax radii are closed form (about 0.9 s).
 
 ## Not verified

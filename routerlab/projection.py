@@ -52,7 +52,11 @@ def project(hidden, weight, linear_bias=None, *, input_format=None, weight_forma
                              "weight_format (e.g. 'fp32') to emulate the cast explicitly")
         logits = (x32 @ w32.T)
         if linear_bias is not None:
-            logits = logits + as_vector(linear_bias, "linear_bias", w.shape[0]).astype(np.float32)
+            bias = as_vector(linear_bias, "linear_bias", w.shape[0])
+            if not np.array_equal(bias.astype(np.float32), bias):
+                raise ValueError("FP32 accumulation needs an FP32-representable linear_bias; "
+                                 "round it explicitly (e.g. quantize(bias, 'fp32'))")
+            logits = logits + bias.astype(np.float32)
         logits = logits.astype(np.float64)
     else:
         logits = x @ w.T
@@ -73,8 +77,8 @@ def projection_error_bound(hidden, weight, linear_bias=None, *, accumulate="fp32
     """Per-element bound [M, E] on |computed logit - exact logit| for the given operands.
 
     Covers rounding during the dot product in `accumulate` precision (any
-    summation order, blocking, split-K or FMA usage) and, optionally, the final
-    cast to `output_format`. Operand casts are *not* included: pass the operands
+    summation order, blocking, split-K or FMA usage, gradual underflow) and,
+    optionally, the final cast to `output_format`. Operand casts are *not* included: pass the operands
     the kernel actually multiplies (e.g. BF16-rounded weights).
 
     * ``method="deterministic"``: worst case, ``gamma_n * sum_i |x_i w_i|`` with
@@ -107,7 +111,9 @@ def projection_error_bound(hidden, weight, linear_bias=None, *, accumulate="fp32
         gamma = n * u / (1 - n * u)
     else:
         gamma = math.expm1(lam * math.sqrt(n) * u + n * u * u / (1 - u))
-    bound = gamma * magnitude
+    acc = resolve_format(accumulate)
+    # Underflow: each of the <= 2n products/additions may add half a subnormal spacing.
+    bound = gamma * magnitude + n * acc.smallest_subnormal
     if output_format is not None:
         out = resolve_format(output_format)
         # Relative rounding for normal results plus half the subnormal spacing for tiny ones.

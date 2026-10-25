@@ -69,6 +69,7 @@ _ALIASES = {
     "bfloat16": "bf16",
     "float16": "fp16", "half": "fp16", "f16": "fp16",
     "float8_e4m3fn": "fp8_e4m3fn", "f8_e4m3": "fp8_e4m3fn", "e4m3": "fp8_e4m3fn", "e4m3fn": "fp8_e4m3fn",
+    "fp8_e4m3": "fp8_e4m3fn", "float8_e4m3": "fp8_e4m3fn",
     "float8_e5m2": "fp8_e5m2", "f8_e5m2": "fp8_e5m2", "e5m2": "fp8_e5m2",
 }
 
@@ -109,6 +110,12 @@ def quantize(values, fmt="bf16", *, overflow: str = "default") -> np.ndarray:
     * ``"inf"``: out-of-range values become +/-inf (formats with infinity only).
 
     NaN inputs stay NaN. Signed zeros are preserved. The input is not modified.
+
+    Rounding is applied once to the exact input value. For float32 (and narrower)
+    inputs this is bit-identical to PyTorch casts; float64 inputs differ from
+    ``torch.tensor(x, dtype=torch.float64).to(torch.bfloat16)`` in rare cases
+    because PyTorch and ml_dtypes round float64 -> float32 -> BF16/FP8 (double
+    rounding). Pass ``np.float32(x)`` to reproduce that.
     """
     spec = resolve_format(fmt)
     if overflow not in _OVERFLOW_MODES:

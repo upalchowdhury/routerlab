@@ -10,9 +10,11 @@ RouterLab is now a general-purpose library and CLI for auditing MoE routers.
   `RouterSpec.from_hf_config` covers 29 HuggingFace `model_type`s. 27 of them are tested side by side
   against the `transformers` router modules.
 - Margin certificates: `certify`, `robustness_radius`, `selection_bounds`. They are sound for every
-  family, and exact where selection is monotone in the logits.
+  family, and exact for ungrouped selection that is monotone in the logits.
 - `compare_routing` / `RoutingReport`: logit error, expert-set changes, moved weight, margins,
-  explained vs. unexplained flips, weight-tolerance checks, invalid selections, expert-load shift.
+  explained vs. unexplained flips, weight-tolerance checks, invalid selections (repeated experts,
+  non-finite weights), and expert-load shift. `passed` is True / False / None: None means the
+  candidate differs but no tolerance was given to judge it.
 - `assert_routing_close`: tolerance-aware assertion for router kernel tests.
 - `project` with operand/output precision emulation; `projection_error_bound`, with deterministic
   (Higham) and probabilistic (Higham & Mary) bounds.

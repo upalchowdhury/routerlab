@@ -138,3 +138,34 @@ def test_clear_errors_for_mismatched_inputs(logits):
         compare_routing(logits, route(logits, SPEC).expert_ids[:, :3], SPEC)
     with pytest.raises(ValueError, match="expects 32 experts"):
         compare_routing(logits[:, :16], logits[:, :16], SPEC)
+
+
+def test_nan_and_inf_weights_are_invalid(logits):
+    ref = route(logits, SPEC)
+    for bad in (np.nan, np.inf):
+        weights = ref.weights.copy()
+        weights[:50] = bad
+        report = compare_routing(logits, (ref.expert_ids, weights), SPEC, tolerance=1e-3)
+        assert report.invalid_tokens == 50 and report.passed is False
+        with pytest.raises(AssertionError):
+            assert_routing_close(logits, (ref.expert_ids, weights), SPEC, atol=1e-3)
+
+
+def test_without_tolerance_differences_are_unchecked_not_passed(logits):
+    garbage = np.random.default_rng(4).normal(size=logits.shape)
+    report = compare_routing(logits, garbage, SPEC)
+    assert report.mismatched_tokens > 0 and report.passed is None and report.status == "UNCHECKED"
+    assert "UNCHECKED" in str(report)
+    ref = route(logits, SPEC)
+    swapped = (ref.expert_ids, ref.weights[:, ::-1])  # same experts, wrong weights
+    assert compare_routing(logits, swapped, SPEC).passed is None
+    assert compare_routing(logits, swapped, SPEC, tolerance=1e-3).passed is False
+    assert compare_routing(logits, garbage, SPEC, tolerance=1e-3).passed is False
+
+
+def test_one_dimensional_top1_ids():
+    spec = RouterSpec(top_k=1, scoring="sigmoid")
+    logits = np.random.default_rng(6).normal(size=(6, 8))
+    ids = route(logits, spec).expert_ids[:, 0]
+    assert compare_routing(logits, ids, spec).passed is True
+    assert compare_routing(ids, ids, spec.replace(num_experts=8)).passed is True

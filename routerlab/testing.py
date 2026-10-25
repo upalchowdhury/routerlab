@@ -69,9 +69,11 @@ def assert_routing_close(reference_logits, candidate, spec: RouterSpec, *, toler
         problems.append(f"{report.unexplained_mismatches} tokens changed experts although their routing "
                         "margin exceeds the tolerance (not a rounding effect):")
         for ex in [e for e in report.mismatch_examples if e.get("unexplained")][:max_report]:
+            row = tol[ex["token"]]
             problems.append(f"    token {ex['token']}: reference {ex['reference_experts']} vs candidate "
-                            f"{ex['candidate_experts']}; margin {ex['radius']:.3e} > tolerance "
-                            f"{float(tol[ex['token']].max()):.3e}")
+                            f"{ex['candidate_experts']}; provably stable under the tolerance "
+                            f"(margin {ex['radius']:.3e}; tolerance in this row "
+                            f"{row.min():.3e}..{row.max():.3e})")
     if check_weights and report.weight_tolerance_violations:
         w = report.weight_worst
         problems.append(f"{report.weight_tolerance_violations} tokens kept their experts but have weights outside "

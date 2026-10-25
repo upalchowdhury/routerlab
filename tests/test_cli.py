@@ -116,3 +116,54 @@ def test_console_entry_point_and_demo():
     assert "UNEXPLAINED" in out.stdout and "PASS" in out.stdout
     version = subprocess.run([sys.executable, "-m", "routerlab.cli", "--version"], capture_output=True, text=True)
     assert version.stdout.startswith("routerlab ")
+
+
+def test_compare_bare_keys_unchecked_and_fail_on(tmp_path, capsys):
+    rng = np.random.default_rng(5)
+    spec = RouterSpec.from_hf_config(CONFIG)
+    logits, bias = rng.normal(size=(300, E)), rng.normal(0, 0.05, E)
+    np.savez(tmp_path / "ref.npz", logits=logits, correction_bias=bias)
+    good = route(logits, spec.with_bias(bias))
+    swapped = good.weights[:, ::-1].copy()
+    np.savez(tmp_path / "swapped.npz", topk_ids=good.expert_ids, topk_weights=swapped)
+    np.savez(tmp_path / "garbage.npz", logits=rng.normal(size=(300, E)))
+    (tmp_path / "c.json").write_text(json.dumps(CONFIG))
+    ref, cfg = str(tmp_path / "ref.npz"), ["--config", str(tmp_path / "c.json")]
+    # Bare keys form one router with its bias attached (not a second one-token "layer").
+    assert main(["compare", ref, ref, *cfg]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Router deepseek_v3: 300 tokens") and "PASS" in out
+    # garbage without tolerance: not a PASS
+    assert main(["compare", ref, str(tmp_path / "garbage.npz"), *cfg]) == 1
+    assert "UNCHECKED" in capsys.readouterr().out
+    # same experts, swapped weights: every mode except 'never' fails once a tolerance is given
+    for mode, code in (("unexplained", 1), ("any", 1), ("never", 0)):
+        assert main(["compare", ref, str(tmp_path / "swapped.npz"), *cfg, "--tolerance", "1e-3",
+                     "--fail-on", mode]) == code
+
+
+def test_selection_reference_with_num_experts(tmp_path):
+    ids = np.array([[0, 1], [2, 3]])
+    np.save(tmp_path / "ids.npy", ids)
+    assert main(["compare", str(tmp_path / "ids.npy"), str(tmp_path / "ids.npy"), "--top-k", "2",
+                 "--num-experts", "4"]) == 0
+
+
+def test_sweep_bias_flag_and_config_parsing(tmp_path, capsys):
+    rng = np.random.default_rng(6)
+    records = {"model.layers.1.mlp.gate": CapturedRouter(
+        name="model.layers.1.mlp.gate", hidden_states=rng.normal(size=(32, H)).astype(np.float32),
+        weight=rng.normal(size=(E, H)).astype(np.float32), correction_bias=None, linear_bias=None,
+        hidden_dtype="float32", weight_dtype="float32")}
+    save_capture(tmp_path / "cap.safetensors", records, spec=RouterSpec.from_hf_config(CONFIG))
+    np.save(tmp_path / "bias.npy", rng.normal(0, 0.05, E))
+    cap = str(tmp_path / "cap.safetensors")
+    with pytest.raises(SystemExit, match="needs a correction bias"):
+        main(["sweep", cap])
+    capsys.readouterr()
+    assert main(["sweep", cap, "--bias", str(tmp_path / "bias.npy"),
+                 "--configs", "name=a, weight_format=bf16 ; name=b,output_format=fp16"]) == 0
+    out = capsys.readouterr().out
+    assert "| a |" in out and "| b |" in out
+    with pytest.raises(SystemExit, match="cannot parse"):
+        main(["sweep", cap, "--bias", str(tmp_path / "bias.npy"), "--configs", "name=a,weight=bf16"])

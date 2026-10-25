@@ -104,3 +104,31 @@ def test_capture_then_assert_against_live_router():
     logits, weights, ids = outputs["out"]
     reference = project(rec.hidden_states, rec.weight)
     assert_routing_close(reference, (ids, weights), spec, rtol=1e-5, atol=1e-5)
+
+
+def test_ernie_bias_under_the_router_and_float64_models(tmp_path):
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.for_model("ernie4_5_moe", **TINY, moe_num_experts=8, moe_k=2)
+    model = AutoModelForCausalLM.from_config(config).eval()
+    with RouterCapture(model) as capture, torch.no_grad():
+        model(input_ids=torch.randint(0, 97, (1, 7)))
+    assert all(rec.correction_bias is not None for rec in capture.records().values())
+
+    class Block(torch.nn.Module):  # toy float64 model with an MoE-style router
+        def __init__(self):
+            super().__init__()
+            self.gate = torch.nn.Linear(32, 8, bias=False, dtype=torch.float64)
+
+        def forward(self, x):
+            return self.gate(x)
+
+    model64 = torch.nn.Sequential(Block())
+    with RouterCapture(model64) as capture, torch.no_grad():
+        model64(torch.randn(5, 32, dtype=torch.float64))
+    capture.save(tmp_path / "f64.safetensors")
+    loaded, _ = load_capture(tmp_path / "f64.safetensors")
+    for name, rec in capture.records().items():
+        assert rec.hidden_states.dtype == np.float64
+        np.testing.assert_array_equal(loaded[name].hidden_states, rec.hidden_states)

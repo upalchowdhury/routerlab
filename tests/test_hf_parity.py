@@ -149,3 +149,22 @@ def test_multimodal_wrapper_configs_use_their_text_config():
     assert RouterSpec.from_hf_config(config.to_dict()).to_dict() == spec.to_dict()
     kimi = AutoConfig.for_model("kimi_k25", text_config={"model_type": "kimi_k2", **GROUPED, "hidden_size": H})
     assert RouterSpec.from_hf_config(kimi).use_correction_bias
+
+
+@pytest.mark.parametrize("model_type", sorted({c.split("/")[0] for c in CASES} | {"kimi_k2"}))
+def test_minimal_config_json_uses_transformers_defaults(model_type):
+    """A config.json with only the expert counts must give the same spec as transformers would."""
+    from transformers import AutoConfig
+
+    live = AutoConfig.for_model("deepseek_v3" if model_type == "kimi_k2" else model_type)
+    if live.num_experts_per_tok is None:  # some classes have no default top-k / expert count
+        live.num_experts_per_tok = 4
+    if getattr(live, "n_routed_experts", 0) is None:
+        live.n_routed_experts = 16
+    full = RouterSpec.from_hf_config(live)
+    minimal = {"model_type": model_type, "num_experts_per_tok": full.top_k, "n_routed_experts": full.num_experts}
+
+    def routing_fields(spec):
+        return {k: v for k, v in spec.to_dict().items() if k not in ("name", "notes")}
+
+    assert routing_fields(RouterSpec.from_hf_config(minimal)) == routing_fields(full)

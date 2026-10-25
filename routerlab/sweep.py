@@ -16,6 +16,7 @@ import numpy as np
 
 from .certify import robustness_radius
 from .compare import RoutingReport, _jsonable, compare_routing
+from .precision import quantize
 from .projection import project
 from .routing import RouterSpec
 
@@ -90,7 +91,8 @@ def precision_sweep(hidden, weight, spec: RouterSpec, configs: Iterable[Precisio
     """Compare float64 reference routing against each precision configuration.
 
     The reference is the exact product of the *stored* hidden states and
-    weights. Configs that fail (e.g. FP16 overflow) are reported, not raised.
+    weights. A linear bias is cast to each config's accumulation precision.
+    Configs that fail (e.g. FP16 overflow) are reported, not raised.
     """
     reference = project(hidden, weight, linear_bias, accumulate="fp64")
     radius = robustness_radius(reference, spec)
@@ -101,7 +103,8 @@ def precision_sweep(hidden, weight, spec: RouterSpec, configs: Iterable[Precisio
                          zero_margin_tokens=int((radius == 0).sum()))
     for config in configs:
         try:
-            logits = project(hidden, weight, linear_bias, input_format=config.input_format,
+            bias = None if linear_bias is None else quantize(linear_bias, config.accumulate)
+            logits = project(hidden, weight, bias, input_format=config.input_format,
                              weight_format=config.weight_format, weight_scaling=config.weight_scaling,
                              accumulate=config.accumulate, output_format=config.output_format)
         except (FloatingPointError, ValueError) as exc:

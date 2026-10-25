@@ -70,9 +70,11 @@ def group_arrays(arrays: dict[str, np.ndarray]) -> dict[str, dict[str, np.ndarra
     groups: dict[str, dict[str, np.ndarray]] = {}
     for key, value in arrays.items():
         name, kind = key, None
+        if key in _SUFFIXES:  # bare 'logits', 'topk_ids', ...: the unnamed router
+            name, kind = "", _SUFFIXES[key]
         for sep in ("/", "."):
             head, _, tail = key.rpartition(sep)
-            if head and tail in _SUFFIXES:
+            if kind is None and head and tail in _SUFFIXES:
                 name, kind = head, _SUFFIXES[tail]
                 break
         if kind is None:
@@ -91,7 +93,7 @@ def _spec_from_args(args, num_experts: int | None = None) -> RouterSpec:
                           topk_group=args.topk_group or args.n_group, group_score=args.group_score,
                           renormalize=args.renormalize, renorm_eps=args.renorm_eps,
                           scaling_factor=args.scaling_factor, use_correction_bias=bool(args.bias),
-                          num_experts=num_experts)
+                          num_experts=args.num_experts or num_experts)
     else:
         raise SystemExit("Specify the router: --config config.json, --spec-json spec.json, or --top-k K [...]")
     for note in spec.notes:
@@ -104,6 +106,7 @@ def _add_spec_args(parser):
     group.add_argument("--config", help="HuggingFace config.json or model directory")
     group.add_argument("--spec-json", help="RouterSpec JSON (as printed by `routerlab spec --json`)")
     group.add_argument("--top-k", type=int)
+    group.add_argument("--num-experts", type=int, help="needed when the reference is a selection, not logits")
     group.add_argument("--scoring", default="softmax", choices=["softmax", "sigmoid", "sqrtsoftplus"])
     group.add_argument("--renormalize", action="store_true")
     group.add_argument("--renorm-eps", type=float, default=0.0)
@@ -111,7 +114,7 @@ def _add_spec_args(parser):
     group.add_argument("--topk-group", type=int)
     group.add_argument("--group-score", default="max", choices=["max", "top2_sum"])
     group.add_argument("--scaling-factor", type=float, default=1.0)
-    group.add_argument("--bias", help="correction bias file (.npy etc.) for single-layer inputs")
+    group.add_argument("--bias", help="correction bias file (.npy etc.); applies to every router compared")
 
 
 # --------------------------------------------------------------------------- commands
@@ -147,6 +150,9 @@ def cmd_inspect(args) -> int:
         out["routers"].append(row)
     if not routers:
         out["notes"].append("No MoE router weights found (expected names ending in .gate/.router/.wg.weight)")
+    hashed = [r.layer for r in routers if r.hash_table]
+    if hashed:
+        out["notes"].append(f"Layers {hashed} use token-id hash routing (tid2eid); only their weights are learned")
     dtypes = sorted({r.dtype for r in routers})
     if dtypes and set(dtypes) <= {"BF16", "F16", "F8_E4M3", "F8_E5M2"}:
         out["notes"].append(f"Router weights are stored as {'/'.join(dtypes)}: FP32 math cannot recover "
@@ -226,9 +232,13 @@ def cmd_compare(args) -> int:
     if args.json:
         Path(args.json).write_text(json.dumps({k: r.to_dict() for k, r in reports.items()}, indent=2) + "\n")
         print(f"wrote {args.json}")
-    if args.fail_on == "any" and any(r.mismatched_tokens or r.invalid_tokens for r in reports.values()):
+    unchecked = [name for name, r in reports.items() if r.passed is None]
+    if unchecked:
+        print(f"note: {len(unchecked)} routers differ but cannot be judged without --tolerance "
+              "(the expected logit error, e.g. from projection_error_bound)", file=sys.stderr)
+    if args.fail_on == "any" and any(r.mismatched_tokens or r.passed is not True for r in reports.values()):
         return 1
-    if args.fail_on == "unexplained" and not all(r.passed for r in reports.values()):
+    if args.fail_on == "unexplained" and any(r.passed is not True for r in reports.values()):
         return 1
     return 0
 
@@ -236,9 +246,16 @@ def cmd_compare(args) -> int:
 def _parse_configs(text: str | None):
     if not text or text == "default":
         return DEFAULT_CONFIGS
+    allowed = {f for f in PrecisionConfig.__dataclass_fields__ if f != "name"}
     configs = []
-    for item in text.split(";"):
-        fields = dict(part.split("=", 1) for part in item.split(",") if part)
+    for item in filter(None, (part.strip() for part in text.split(";"))):
+        fields = {}
+        for part in filter(None, (p.strip() for p in item.split(","))):
+            key, sep, value = part.partition("=")
+            key, value = key.strip(), value.strip()
+            if not sep or (key != "name" and key not in allowed):
+                raise SystemExit(f"--configs: cannot parse {part!r}; use name=...,{'|'.join(sorted(allowed))}=...")
+            fields[key] = value
         name = fields.pop("name", item)
         configs.append(PrecisionConfig(name=name, **fields))
     return tuple(configs)
@@ -277,6 +294,9 @@ def cmd_sweep(args) -> int:
         spec = _spec_from_args(args, jobs[0][2].shape[0])
     if spec is None:
         raise SystemExit("No router spec in the capture; pass --config config.json")
+    if args.bias:
+        extra = _single_array(args.bias)
+        jobs = [(name, hidden, weight, extra, linear) for name, hidden, weight, _, linear in jobs]
     if args.layers:
         wanted = set(args.layers.split(","))
         jobs = [j for j in jobs if j[0] in wanted or str(_layer_of(j[0])) in wanted]

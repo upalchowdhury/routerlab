@@ -145,6 +145,7 @@ class RouterTensors:
     dtype: str
     correction_bias: str | None = None
     linear_bias: str | None = None
+    hash_table: str | None = None   # token-id -> expert table (hash routing, e.g. DeepSeek-V4)
 
     def to_dict(self):
         return asdict(self)
@@ -208,11 +209,20 @@ class Checkpoint:
             if scale.ndim != 2:
                 raise ValueError(f"{scale_name}: expected a 2-D block scale, got shape {scale.shape}")
             rows, cols = array.shape
-            block = [128 if math.ceil(n / 128) == s else math.ceil(n / s)
-                     for n, s in zip((rows, cols), scale.shape, strict=True)]
+            block = self._block_size()
+            if block is None or [math.ceil(n / b) for n, b in zip((rows, cols), block, strict=True)] != \
+                    list(scale.shape):
+                # No (consistent) quantization_config: 128x128 blocks if they fit, else infer.
+                block = [128 if math.ceil(n / 128) == s else math.ceil(n / s)
+                         for n, s in zip((rows, cols), scale.shape, strict=True)]
             expanded = np.repeat(np.repeat(scale, block[0], axis=0), block[1], axis=1)[:rows, :cols]
             array = (array.astype(np.float32) * expanded).astype(np.float32)
         return array
+
+    def _block_size(self) -> list[int] | None:
+        quant = (self.config or {}).get("quantization_config") or {}
+        block = quant.get("weight_block_size")
+        return [int(b) for b in block] if isinstance(block, (list, tuple)) and len(block) == 2 else None
 
     # ------------------------------------------------------------------ routers
     def _config_value(self, *keys):
@@ -233,12 +243,18 @@ class Checkpoint:
         """Every MoE router weight [E, H] in the checkpoint, ordered by layer."""
         experts = self._config_value("n_routed_experts", "num_local_experts", "num_experts", "moe_num_experts")
         hidden = self._config_value("hidden_size")
+        try:
+            uses_bias = self.router_spec().use_correction_bias if self.config is not None else None
+        except ValueError:
+            uses_bias = None
         found = []
         for name in self._where:
             if not name.endswith(".weight"):
                 continue
             module = name[: -len(".weight")]
-            if module.rsplit(".", 1)[-1] not in _ROUTER_NAMES:
+            parts = module.split(".")
+            # gate / router / wg, or Granite's router.layer
+            if parts[-1] not in _ROUTER_NAMES and parts[-2:] != ["router", "layer"]:
                 continue
             dtype, shape = self.info(name)
             if len(shape) != 2 or shape[0] < 2:
@@ -246,11 +262,17 @@ class Checkpoint:
             if (experts is not None and shape[0] != int(experts)) or (hidden is not None and shape[1] != int(hidden)):
                 continue
             match = _LAYER_RE.search(module)
+            correction = self._find_bias(module, shape[0])
+            linear = self._sized(f"{module}.bias", shape[0])
+            if correction is None and linear is not None and uses_bias:
+                # e.g. DeepSeek-V4 checkpoints store e_score_correction_bias as `<gate>.bias`;
+                # no supported router with a correction bias also has a linear bias.
+                correction, linear = linear, None
             found.append(RouterTensors(
                 module=module, layer=int(match.group(1)) if match else None, weight=name,
                 num_experts=shape[0], hidden_size=shape[1], dtype=dtype,
-                correction_bias=self._find_bias(module, shape[0]),
-                linear_bias=self._sized(f"{module}.bias", shape[0])))
+                correction_bias=correction, linear_bias=linear,
+                hash_table=f"{module}.tid2eid" if f"{module}.tid2eid" in self._where else None))
         return sorted(found, key=lambda r: (r.layer is None, r.layer or 0, r.module))
 
     def _sized(self, name: str, size: int) -> str | None:

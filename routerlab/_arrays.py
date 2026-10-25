@@ -61,11 +61,15 @@ def as_vector(value, name: str, length: int) -> np.ndarray:
 def broadcast_bound(bound, shape, name: str = "tolerance") -> np.ndarray:
     """Broadcast a bound to `shape` = (M, E).
 
-    Accepts a scalar, per-row [M, 1], per-expert [E], or per-element [M, E].
-    A 1-D array of length M (when M != E) is also read as per-row.
+    Accepts a scalar, per-row [M, 1], per-expert [1, E] or [E], or per-element
+    [M, E]. A 1-D array of length M (when M != E) is also read as per-row; when
+    M == E a 1-D bound is ambiguous and rejected.
     """
     array = to_numpy(bound).astype(np.float64, copy=False)
-    if array.ndim == 1 and array.shape[0] == shape[0] and shape[0] != shape[1]:
+    if array.ndim == 1 and array.shape[0] > 1 and array.shape[0] == shape[0]:
+        if shape[0] == shape[1]:
+            raise ValueError(f"1-D {name} of length {shape[0]} is ambiguous for {shape[0]} tokens x "
+                             f"{shape[1]} experts; pass shape [M, 1] (per token) or [1, E] (per expert)")
         array = array[:, None]
     elif array.ndim >= 2:
         array = array.reshape(-1, array.shape[-1])

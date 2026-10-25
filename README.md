@@ -12,9 +12,9 @@ Router deepseek_v3-style (synthetic): 2048 tokens, top-8 of 64 experts
   selection   891 tokens changed expert set (43.51%), mean overlap 0.918274
   weights     moved mass mean 2.000e-01  max 6.314e-01   max |err| (same experts) 3.458e-01
   WEIGHTS     1157 tokens with the same experts have weights outside tolerance (token 839, expert 39: 0.574148 vs 0.229486)
-  margins     radius min 3.828e-05  p1 6.826e-04  p5 5.292e-03  median 7.218e-02 (logit units)
-  tolerance   per-element logit tolerance (max 2.216e-02): 74 tokens at risk
-  verdict     52 explained by tolerance, 839 UNEXPLAINED (margin larger than tolerance)
+  margins     radius min 3.828e-05  p1 7.131e-04  p5 5.516e-03  median 7.365e-02 (logit units)
+  tolerance   per-element logit tolerance (max 2.216e-02): 72 tokens at risk
+  verdict     51 explained by tolerance, 840 UNEXPLAINED (margin larger than tolerance)
   largest margin among changed tokens: 4.976e-01
   load        largest per-expert change 284 tokens (expert 11)
     token 2: -[19] +[45]  margin 1.910e-02  UNEXPLAINED
@@ -88,14 +88,14 @@ The assertion lets a token change experts only if the tolerance can explain it. 
 
 ```text
 AssertionError: Routing mismatch for 'deepseek_v3-style (synthetic)' (2048 tokens, top-8):
-  839 tokens changed experts although their routing margin exceeds the tolerance (not a rounding effect):
-      token 2: reference [19, 27, 33, 38, 48, 50, 52, 53] vs candidate [27, 33, 38, 45, 48, 50, 52, 53]; margin 1.910e-02 > tolerance 9.919e-03
-      token 7: reference [2, 19, 22, 33, 38, 48, 51, 53] vs candidate [19, 22, 27, 33, 38, 48, 51, 53]; margin 3.192e-01 > tolerance 1.113e-02
+  840 tokens changed experts although their routing margin exceeds the tolerance (not a rounding effect):
+      token 2: reference [19, 27, 33, 38, 48, 50, 52, 53] vs candidate [27, 33, 38, 45, 48, 50, 52, 53]; provably stable under the tolerance (margin 1.910e-02; tolerance in this row 5.930e-04..9.919e-03)
+      token 7: reference [2, 19, 22, 33, 38, 48, 51, 53] vs candidate [19, 22, 27, 33, 38, 48, 51, 53]; provably stable under the tolerance (margin 3.192e-01; tolerance in this row 4.847e-04..1.113e-02)
   1157 tokens kept their experts but have weights outside tolerance; worst at token 839, expert 39: reference 0.574148, candidate 0.229486 (allowed |delta| 9.993e-03)
-  (52 other tokens changed experts within tolerance: expected near-ties)
+  (51 other tokens changed experts within tolerance: expected near-ties)
 ```
 
-It also checks logits against the tolerance (when the candidate provides logits), rejects duplicate experts, and checks weights of unchanged tokens against a bound derived from the tolerance. Use `weight_rtol=2**-8` if the engine returns BF16 weights.
+It also checks logits against the tolerance (when the candidate provides logits), rejects duplicate experts and non-finite weights, and checks weights of unchanged tokens against a bound derived from the tolerance. Use `weight_rtol=2**-8` if the engine returns BF16 weights.
 
 ### 3. Compare dumps from two systems
 
@@ -117,7 +117,9 @@ routerlab compare trainer.npz engine.npz --config config.json --tolerance 2e-2 -
 
 *(Above: synthetic DeepSeek-V3-style layers, float64 reference vs. BF16 logits. About 1% of tokens change experts, and every change is explained by a margin below the BF16 error.)*
 
-Key conventions: use `NAME` or `NAME/logits` for float logits, `NAME/topk_ids` with an optional `NAME/topk_weights` for selections, and `NAME/correction_bias` to attach a bias. The exit status is 1 when any layer has unexplained flips, invalid selections, or out-of-tolerance logits or weights. Change that with `--fail-on any|never`.
+Key conventions: use `NAME` or `NAME/logits` for float logits, `NAME/topk_ids` with an optional `NAME/topk_weights` for selections, and `NAME/correction_bias` to attach a bias. Bare `logits`/`topk_ids`/... keys describe a single router.
+
+Exit status 1 means some layer FAILED (unexplained flips, invalid selections, or out-of-tolerance logits or weights) or is UNCHECKED: it differs, but no `--tolerance` was given to judge it. `--fail-on any` also fails on explained flips; `--fail-on never` always exits 0.
 
 Per token, the report gives the logit error, set changes, moved routing weight, the radius distribution, how many tokens are at risk under the tolerance, explained vs. unexplained flips with examples, and per-expert load shift.
 
@@ -189,10 +191,12 @@ Multimodal wrappers (`llama4`, `kimi_k25`, and others with a `text_config`) use 
 
 Let `S` be the reference expert set of a token, and suppose every logit may be off by at most `e`. Interval arithmetic bounds each selection score `[lo, hi]`. Group scores (max and top-2 sum) are monotone in each element, so they're bounded the same way. The set is **certified** if every selected group's lower bound beats every unselected group's upper bound, and every selected expert's lower bound beats every eligible unselected expert's upper bound. Certified means no perturbation within `e` can change or tie the selection.
 
-- For softmax and sigmoid routers without a bias, selection is a monotone function of the logits, so the certificate reduces to *gap > 2e* at the expert boundary and at the group boundary. It is exact, and so is the radius (half the gap).
-- With a correction bias, scores are bounded through the scoring function. This is exact for elementwise sigmoid/sqrt-softplus and sound but conservative for softmax. The radius is then found by bisection on the certificate, starting from a slope-based lower bound.
+- For softmax and sigmoid routers without a bias or grouping, selection is a monotone function of the logits, so the certificate reduces to *gap > 2e* at the k-th/(k+1)-th boundary. It is exact, and so is the radius (half the gap).
+- With a correction bias, scores are bounded through the scoring function: elementwise for sigmoid/sqrt-softplus, and per-element (sound but conservative) for softmax.
+- Group-limited selection is certified when every group holding a chosen expert is guaranteed to stay selected, and no expert of a group that could become selected can overtake a chosen one. This is sound, but it can be conservative where group and expert boundaries interact.
+- The radius is otherwise found by bisection on the certificate, starting from a slope-based lower bound.
 
-The property tests in `tests/test_certify.py` check soundness for every family under random and worst-case ("corner") perturbations, and check tightness where it's claimed.
+The property tests in `tests/test_certify.py` check soundness for every family under random and worst-case ("corner") perturbations, including logits 40 apart (where a naive softmax bound cancels), and check tightness where it's claimed.
 
 **Error bounds.** `projection_error_bound(x, w, accumulate="fp32")` returns per-logit bounds `γ_n · Σ|x_i w_i|` (Higham, 2002). These hold for any summation order, blocking, split-K or FMA use, plus an optional output cast. `method="probabilistic"` gives the much tighter Higham & Mary (2019) bound, which holds with high probability under its rounding model. Pass the operands the kernel actually multiplies, for example BF16-rounded weights.
 
@@ -202,7 +206,7 @@ The property tests in `tests/test_certify.py` check soundness for every family u
 | --- | --- |
 | `RouterSpec`, `RouterSpec.from_hf_config`, `route`, `Routing` | reference routing (float64, ties go to the lower index) |
 | `robustness_radius`, `certify`, `selection_bounds` | margin certificates |
-| `compare_routing` → `RoutingReport`, `format_reports` | comparison report (`.summary()`, `.to_dict()`, `.passed`) |
+| `compare_routing` → `RoutingReport`, `format_reports` | comparison report (`.summary()`, `.to_dict()`; `.passed` is True / False / None = unchecked without a tolerance) |
 | `assert_routing_close` | test assertion |
 | `project`, `projection_error_bound` | projection with precision emulation; rigorous/probabilistic error bounds |
 | `quantize`, `quantize_scaled`, `FORMATS`, `is_representable` | bit-exact BF16/FP16/TF32/FP8-E4M3/FP8-E5M2 casts (RNE, subnormals, overflow modes) |
@@ -213,7 +217,7 @@ The property tests in `tests/test_certify.py` check soundness for every family u
 ## Precision and scope notes
 
 - The reference computes in float64 from the values you give it. It never casts inputs silently; FP32 emulation refuses operands that aren't FP32-representable unless you ask for the cast.
-- `quantize` matches PyTorch's casts bit-for-bit by default (E4M3 saturates at ±448, as `tensor.to(torch.float8_e4m3fn)` does). `overflow="nan"` gives the OCP/ml_dtypes behaviour. The tests check this against PyTorch, ml_dtypes and NumPy over every representable value and every rounding midpoint.
+- For float32 (and narrower) inputs, `quantize` matches PyTorch's casts bit-for-bit by default (E4M3 saturates at ±448, as `tensor.to(torch.float8_e4m3fn)` does). `overflow="nan"` gives the OCP/ml_dtypes behaviour. The tests check this against PyTorch, ml_dtypes and NumPy over every representable value and every rounding midpoint. Float64 inputs are rounded once, so they can differ from PyTorch's float64 → float32 → BF16 double rounding.
 - `project(..., accumulate="fp32")` uses NumPy's float32 GEMM. Its errors are representative in size but not bitwise equal to any GPU kernel. Use `projection_error_bound` when you need guarantees.
 - Exact ties are broken towards the lower index. Engines' `torch.topk` tie order is unspecified, so tied tokens have radius 0 and any difference at them counts as explained.
 - `routerlab bench` and `routerlab.gpu_kernels` (Triton candidates for BF16 → FP32 router projection, CUDA-graph timing) are **experimental** and **have not been validated on GPU hardware by the maintainers**. Every row is checked against the float64 reference before it's timed. See [VALIDATION.md](VALIDATION.md).
