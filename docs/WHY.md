@@ -62,6 +62,7 @@ token-layer routing. Setup and caveats are in [case-studies/](case-studies/READM
 | Can this router run in BF16/FP8? | `routerlab sweep` on activations captured with `RouterCapture` |
 | Will engine precision create exact ties? | `boundary_ties(logits, spec, "fp32" or "bf16")` |
 | What precision is this checkpoint's router stored in, and is its bias BF16-safe? | `routerlab inspect hf://org/model --stats` (no download) |
+| Can the router be ternary / INT4 / INT8, and what does it cost to keep it in BF16? | `routerlab inspect --lowbit`, `routerlab sweep --configs lowbit --budget PCT`, `routerlab.lowbit` |
 | Do two runs route the same? | `RouterCapture` in both runs, then `routerlab compare run_a.safetensors run_b.safetensors` |
 | Does the rollout engine route like the trainer? | `routerlab compare trainer.npz vllm_routed_experts.npy` |
 
@@ -85,6 +86,14 @@ survives a cast.
 **RL and post-training teams:** measure the routing mismatch between rollout and training per
 layer, and tell precision-explained flips from implementation differences, before reaching for
 routing replay.
+
+**Ternary and low-bit hardware teams** (BitNet b1.58-style {-1, 0, +1} weights, INT4/INT8
+accelerators): decide which parts of an MoE model can be quantized. On real models, post-hoc
+ternary routers re-route 93–97% of tokens and keep only 55–68% of the chosen experts, while
+routers are about 0.02–0.03% of all parameters, so keep them in BF16
+([case study](case-studies/lowbit.md)). Use `routerlab inspect <model> --lowbit` and
+`routerlab sweep --configs lowbit --budget 1` for a per-layer plan, and `routerlab.lowbit` for
+integer-exact ternary emulation and 1.6-bit packing.
 
 **Serving reliability and determinism:** check batch invariance and exact-tie exposure when
 changing kernels, batch-size thresholds or hardware.

@@ -21,7 +21,12 @@ from .precision import quantize
 from .projection import project
 from .routing import RouterSpec
 
-__all__ = ["PrecisionConfig", "DEFAULT_CONFIGS", "precision_sweep", "SweepResult"]
+__all__ = ["PrecisionConfig", "DEFAULT_CONFIGS", "LOWBIT_CONFIGS", "precision_sweep", "SweepResult",
+           "plan_precision"]
+
+_WEIGHT_BITS = {None: 16.0, "fp64": 64.0, "fp32": 32.0, "tf32": 19.0, "bf16": 16.0, "fp16": 16.0,
+                "fp8_e4m3fn": 8.0, "fp8_e5m2": 8.0, "int8": 8.0, "int4": 4.0, "int3": 3.0, "int2": 2.0,
+                "ternary": 1.58}
 
 
 @dataclass(frozen=True)
@@ -35,8 +40,13 @@ class PrecisionConfig:
     accumulate: str = "fp32"
     output_format: str | None = None
 
+    @property
+    def weight_bits(self) -> float:
+        """Nominal storage bits per router weight (stored values assumed BF16 when unset)."""
+        return _WEIGHT_BITS.get(self.weight_format, 16.0)
+
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return {**self.__dict__, "weight_bits": self.weight_bits}
 
 
 DEFAULT_CONFIGS = (
@@ -47,6 +57,19 @@ DEFAULT_CONFIGS = (
     PrecisionConfig("fp16 operands, fp16 logits", input_format="fp16", weight_format="fp16", output_format="fp16"),
     PrecisionConfig("fp8-e4m3 weights (per-channel scale)", input_format="bf16",
                     weight_format="fp8_e4m3fn", weight_scaling="channel"),
+)
+
+
+LOWBIT_CONFIGS = (
+    PrecisionConfig("bf16 operands, fp32 logits", input_format="bf16", weight_format="bf16"),
+    PrecisionConfig("int8 weights (per-channel)", weight_format="int8"),
+    PrecisionConfig("int8 weights + int8 activations", input_format="int8", weight_format="int8"),
+    PrecisionConfig("int4 weights (per-channel)", weight_format="int4"),
+    PrecisionConfig("int4 weights (group 128)", weight_format="int4", weight_scaling="group128"),
+    PrecisionConfig("ternary weights (per-tensor absmean)", weight_format="ternary"),
+    PrecisionConfig("ternary weights (per-channel)", weight_format="ternary", weight_scaling="channel"),
+    PrecisionConfig("ternary weights (group 128)", weight_format="ternary", weight_scaling="group128"),
+    PrecisionConfig("ternary + int8 activations (BitNet b1.58)", input_format="int8", weight_format="ternary"),
 )
 
 
@@ -87,6 +110,22 @@ class SweepResult:
                          f"{100 * r.mismatch_rate:.3f} | {r.moved_weight_mean:.2e} | {r.max_load_shift} | "
                          f"{row['ties']} |")
         return "\n".join(lines)
+
+
+def plan_precision(results: dict[str, SweepResult], max_change_rate: float) -> dict[str, dict[str, Any]]:
+    """Per router: the configuration with the fewest weight bits whose routing-change rate
+    stays within `max_change_rate` (e.g. 0.005 = 0.5% of tokens). Routers where nothing
+    qualifies get None (keep the stored precision)."""
+    plan = {}
+    for name, result in results.items():
+        candidates = [(row["config"], row["report"]) for row in result.rows if "report" in row
+                      and row["report"].mismatch_rate <= max_change_rate]
+        if not candidates:
+            plan[name] = {"config": None, "weight_bits": 16.0, "change_rate": None}
+            continue
+        config, report = min(candidates, key=lambda c: (c[0].weight_bits, c[1].mismatch_rate))
+        plan[name] = {"config": config.name, "weight_bits": config.weight_bits, "change_rate": report.mismatch_rate}
+    return plan
 
 
 def precision_sweep(hidden, weight, spec: RouterSpec, configs: Iterable[PrecisionConfig] = DEFAULT_CONFIGS,

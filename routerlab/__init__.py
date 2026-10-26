@@ -10,10 +10,19 @@ from .certify import certify, robustness_radius, selection_bounds
 from .checkpoint import Checkpoint, RouterTensors, SafetensorsFile, save_safetensors
 from .compare import RoutingReport, as_routing, compare_routing, format_reports
 from .keys import boundary_ties, selection_keys
+from .lowbit import (
+                     lowbit_project,
+                     pack_ternary,
+                     quantize_activations,
+                     quantize_int,
+                     ternarize,
+                     unpack_ternary,
+                     weight_footprint,
+)
 from .precision import FORMATS, FloatFormat, is_representable, quantize, quantize_scaled, resolve_format, round_bf16
 from .projection import project, projection_error_bound
 from .routing import SUPPORTED_MODEL_TYPES, RouterSpec, Routing, route, topk_indices
-from .sweep import DEFAULT_CONFIGS, PrecisionConfig, SweepResult, precision_sweep
+from .sweep import DEFAULT_CONFIGS, LOWBIT_CONFIGS, PrecisionConfig, SweepResult, plan_precision, precision_sweep
 from .testing import assert_routing_close
 
 __all__ = [
@@ -25,6 +34,8 @@ __all__ = [
     "assert_routing_close",
     "project", "projection_error_bound",
     "FloatFormat", "FORMATS", "quantize", "quantize_scaled", "round_bf16", "resolve_format", "is_representable",
-    "PrecisionConfig", "DEFAULT_CONFIGS", "precision_sweep", "SweepResult",
+    "PrecisionConfig", "DEFAULT_CONFIGS", "LOWBIT_CONFIGS", "precision_sweep", "SweepResult", "plan_precision",
+    "ternarize", "quantize_int", "quantize_activations", "lowbit_project", "pack_ternary", "unpack_ternary",
+    "weight_footprint",
     "Checkpoint", "RouterTensors", "SafetensorsFile", "save_safetensors",
 ]

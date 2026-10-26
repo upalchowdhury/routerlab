@@ -1,6 +1,6 @@
 # Validation status
 
-This records what has been checked, how, and what has not. Updated October 25, 2026 (v0.3.0).
+This records what has been checked, how, and what has not. Updated October 26, 2026 (v0.4.0).
 
 ## Verified (CPU)
 
@@ -8,7 +8,12 @@ Environment: macOS (Apple silicon), Python 3.12.12, NumPy 2.5.4, PyTorch 2.14.1 
 transformers 5.20.2, ml_dtypes 0.5.4, safetensors 0.6.0. CI repeats the checks on Linux and macOS
 across Python 3.10–3.13 and NumPy 1.24–2.x.
 
-- **Test suite:** 194 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`. Property-based
+- **Test suite:** 203 passed, 4 skipped (the GPU tests), plus 5 tests in `examples/`.
+- **Low-bit emulation** (`tests/test_lowbit.py`): ternary codes and scales match an independent
+  implementation of the BitNet b1.58 absmean equations. INT8 activations follow the BitNet
+  reference code (scale 127/absmax). The integer path equals the float64 product of the
+  dequantized operands to 1e-12. Ternary packing round-trips in both schemes. The low-bit sweeps
+  in `docs/case-studies/lowbit.md` are post-hoc quantization on real captured activations. Property-based
   tests (Hypothesis) were also run at 3,000 examples per property with three seeds. One soundness bug
   (an infinite radius) was found and fixed.
 - **Real models, real text:** OLMoE-1B-7B and LFM2-8B-A1B on 16,384 WikiText-2 tokens. The workflow

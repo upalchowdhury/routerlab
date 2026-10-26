@@ -32,6 +32,7 @@ The standard checks miss this. Exact `topk_ids` comparisons are flaky, so they g
 - **Drop-in test assertion:** `assert_routing_close` for kernel tests. It's strict but not flaky: near-ties pass, bugs fail with token-level detail, and the tolerance comes from a rigorous FP32 error bound.
 - **Comparisons for anything you can dump:** logits or top-k ids from any engine, vLLM's `routed_experts`, or two runs captured from PyTorch.
 - **Precision tools:** bit-exact BF16/FP16/FP8 emulation, precision sweeps on real activations, and detection of exact top-k ties in engine precision.
+- **Ternary and low-bit routers:** BitNet b1.58 absmean ternary and INT4/INT8 quantization, integer-exact (multiply-free) ternary emulation, 1.6-bit packing, and a per-layer precision plan within a routing-change budget. On real models, post-hoc ternary routers re-route 93–97% of tokens, while routers are only 0.02–0.03% of all parameters, so keep them in BF16 ([case study](docs/case-studies/lowbit.md)).
 - **Checkpoint inspection without downloading:** `routerlab inspect hf://deepseek-ai/DeepSeek-V3 --stats` reads router weights and biases by HTTP range requests in seconds.
 
 From `routerlab demo`: a candidate kernel with a porting bug (DeepSeek-V2's group rule on a V3-style router, and the correction bias leaking into the weights) checked against the reference:
@@ -189,7 +190,24 @@ Router olmoe, 4096 tokens. Reference margin (logit units): p1 3.093e-04, p5 1.97
 
 Without a capture, `routerlab sweep --checkpoint DIR --layer N --hidden hidden.npy` reads the router straight from a checkpoint. `--synthetic N` uses Gaussian inputs, scaled by the layer's `post_attention_layernorm` weight when there is one; these results are labelled as indicative only.
 
-### 5. Inspect a checkpoint without downloading it
+### 5. Plan low-bit and ternary deployments
+
+```bash
+routerlab sweep router_inputs.safetensors --configs lowbit --budget 1   # cheapest per-layer config re-routing <= 1%
+routerlab inspect hf://deepseek-ai/DeepSeek-V3 --lowbit                # router share of parameters, quantization error
+```
+
+```python
+from routerlab import ternarize, lowbit_project, pack_ternary, weight_footprint
+
+q = ternarize(router_weight, "channel")        # BitNet b1.58 absmean: codes in {-1, 0, +1} plus scales
+logits = lowbit_project(hidden, q)             # INT8 activations, integer-exact add/subtract accumulation
+blob = pack_ternary(q.codes, "base3")          # 5 trits per byte = 1.6 bits/weight
+```
+
+`project(..., weight_format="ternary" | "int4" | "int8", weight_scaling="tensor" | "channel" | "group128", input_format="int8")` uses the same integer path, so every comparison and sweep tool works on low-bit routers.
+
+### 6. Inspect a checkpoint without downloading it
 
 ```bash
 routerlab inspect hf://deepseek-ai/DeepSeek-V3 --stats     # or a local directory / .safetensors file
@@ -258,7 +276,8 @@ The property tests in `tests/test_certify.py` check soundness for every family u
 | `project`, `projection_error_bound` | projection with precision emulation; rigorous/probabilistic error bounds |
 | `quantize`, `quantize_scaled`, `FORMATS`, `is_representable` | bit-exact BF16/FP16/TF32/FP8-E4M3/FP8-E5M2 casts (RNE, subnormals, overflow modes) |
 | `selection_keys`, `boundary_ties` | selection keys in engine precision (FP32/BF16); tokens with exact ties at the top-k or group boundary |
-| `precision_sweep`, `PrecisionConfig` | what-if over precision configurations |
+| `precision_sweep`, `PrecisionConfig`, `LOWBIT_CONFIGS`, `plan_precision` | what-if over precision configurations; cheapest per-layer config within a budget |
+| `ternarize`, `quantize_int`, `quantize_activations`, `lowbit_project`, `pack_ternary`, `weight_footprint` | ternary (BitNet b1.58) and INT weights, INT8 activations, integer-exact emulation, packing and footprint |
 | `Checkpoint`, `SafetensorsFile`, `save_safetensors` | router discovery and dependency-free safetensors I/O, local or `hf://org/model` (HTTP range reads) |
 | `routerlab.capture.RouterCapture`, `load_capture` | capture router inputs and the logits each router computed, from any PyTorch model (CPU, CUDA, MPS) |
 

@@ -26,7 +26,7 @@ from .compare import RoutingReport, _jsonable, compare_routing, format_reports
 from .precision import is_representable
 from .remote import is_remote
 from .routing import RouterSpec
-from .sweep import DEFAULT_CONFIGS, PrecisionConfig, precision_sweep
+from .sweep import DEFAULT_CONFIGS, LOWBIT_CONFIGS, PrecisionConfig, plan_precision, precision_sweep
 
 _SUFFIXES = {"logits": "logits", "topk_ids": "ids", "expert_ids": "ids", "topk_weights": "weights",
              "weights": "weights", "correction_bias": "bias", "e_score_correction_bias": "bias"}
@@ -193,11 +193,19 @@ def cmd_inspect(args) -> int:
             row["weight_bf16_representable"] = bool(is_representable(weight, "bf16").all())
         if bias is not None:
             row.update(_bias_stats(bias))
+        if args.lowbit:
+            row.update(_lowbit_stats(weight))
         return row
 
-    if args.stats and routers:
+    import math
+    total_params = sum(math.prod(ckpt.info(name)[1]) for name in ckpt.names()) if routers else 0
+    router_params = sum(r.num_experts * r.hidden_size for r in routers)
+    if total_params:
+        out["parameters"] = {"total": total_params, "routers": router_params,
+                             "router_fraction": router_params / total_params}
+    if (args.stats or args.lowbit) and routers:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(16 if is_remote(args.path) else 1) as pool:
+        with ThreadPoolExecutor(16 if is_remote(args.path) else 4) as pool:
             all_stats = list(pool.map(stats, routers))
     else:
         all_stats = [{} for _ in routers]
@@ -231,6 +239,11 @@ def cmd_inspect(args) -> int:
         print(json.dumps(_jsonable(out), indent=2))
         return 0
     print(f"{args.path}: {out['tensors']} tensors, {len(routers)} routers")
+    if "parameters" in out:
+        par = out["parameters"]
+        print(f"router weights: {par['routers']:,} of {par['total']:,} parameters "
+              f"({100 * par['router_fraction']:.3f}%); keeping them in BF16 costs "
+              f"{par['routers'] * 2 / 1e6:.1f} MB")
     if out["spec"]:
         print("spec:", RouterSpec.from_dict(out["spec"]).describe())
     if routers:
@@ -239,12 +252,26 @@ def cmd_inspect(args) -> int:
             stats = (f"  |w|max {row['weight_abs_max']:.3g}" if "weight_abs_max" in row else "")
             if "bias_min" in row:
                 stats += f"  bias [{row['bias_min']:.3g}, {row['bias_max']:.3g}]"
+            if "ternary_rel_error" in row:
+                stats += (f"  rel.err ternary {row['ternary_rel_error']:.2f} int4 {row['int4_rel_error']:.3f} "
+                          f"int8 {row['int8_rel_error']:.4f}  ternary zeros {row['ternary_sparsity']:.0%}")
             print(f"{'-' if r.layer is None else r.layer:>5}  {str([r.num_experts, r.hidden_size]):>13}  "
                   f"{r.dtype:5}  {'yes' if r.correction_bias else 'no':10}  {'yes' if r.linear_bias else 'no':9}"
                   f"  {r.weight}{stats}")
     for note in out["notes"]:
         print(f"note: {note}")
     return 0
+
+
+def _lowbit_stats(weight: np.ndarray) -> dict:
+    """Relative weight error (Frobenius) of post-hoc low-bit quantization, and ternary sparsity."""
+    from .lowbit import quantize_int, ternarize
+    norm = float(np.linalg.norm(weight)) or 1.0
+    ternary = ternarize(weight, "channel")
+    return {"ternary_rel_error": float(np.linalg.norm(ternary.dequantize() - weight)) / norm,
+            "ternary_sparsity": ternary.sparsity,
+            "int4_rel_error": float(np.linalg.norm(quantize_int(weight, 4).dequantize() - weight)) / norm,
+            "int8_rel_error": float(np.linalg.norm(quantize_int(weight, 8).dequantize() - weight)) / norm}
 
 
 def _bias_stats(bias: np.ndarray) -> dict:
@@ -346,6 +373,11 @@ def cmd_compare(args) -> int:
 def _parse_configs(text: str | None):
     if not text or text == "default":
         return DEFAULT_CONFIGS
+    if text == "lowbit":
+        return LOWBIT_CONFIGS
+    if text == "all":
+        names = {c.name for c in DEFAULT_CONFIGS}
+        return DEFAULT_CONFIGS + tuple(c for c in LOWBIT_CONFIGS if c.name not in names)
     allowed = {f for f in PrecisionConfig.__dataclass_fields__ if f != "name"}
     configs = []
     for item in filter(None, (part.strip() for part in text.split(";"))):
@@ -420,8 +452,22 @@ def cmd_sweep(args) -> int:
                 total = sum(r.num_tokens for r in reports)
                 changed = sum(r.mismatched_tokens for r in reports)
                 print(f"- {config.name}: {changed}/{total} ({100 * changed / max(total, 1):.4g}%)")
+    output = {k: v.to_dict() for k, v in results.items()}
+    if args.budget is not None:
+        plan = plan_precision(results, args.budget / 100)
+        weights = {name: weight.size for name, _, weight, *_ in jobs}
+        print(f"## precision plan (routing-change budget {args.budget:g}% per router)")
+        total_bits = sum(weights[n] * p["weight_bits"] for n, p in plan.items())
+        for name, entry in plan.items():
+            rate = "-" if entry["change_rate"] is None else f"{100 * entry['change_rate']:.3f}%"
+            print(f"- {name}: {entry['config'] or 'keep stored precision (nothing within budget)'} "
+                  f"[{entry['weight_bits']:g} bits/weight, {rate} changed]")
+        bf16_bits = 16 * sum(weights[n] for n in plan)
+        print(f"router weights: {total_bits / 8 / 1e6:.2f} MB vs {bf16_bits / 8 / 1e6:.2f} MB in BF16 "
+              f"({total_bits / bf16_bits:.1%})")
+        output["_plan"] = plan
     if args.json:
-        Path(args.json).write_text(json.dumps({k: v.to_dict() for k, v in results.items()}, indent=2) + "\n")
+        Path(args.json).write_text(json.dumps(_jsonable(output), indent=2) + "\n")
         print(f"wrote {args.json}")
     return 0
 
@@ -464,6 +510,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("inspect", help="list the routers in a checkpoint")
     p.add_argument("path", help="model directory or .safetensors file")
     p.add_argument("--stats", action="store_true", help="load weights and report magnitudes/representability")
+    p.add_argument("--lowbit", action="store_true",
+                   help="load weights and report ternary/INT4/INT8 quantization error and ternary sparsity")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_inspect)
 
@@ -488,8 +536,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("sweep", help="how often would routing change under BF16/FP16/FP8?",
-                       description="Configs: 'default', or 'name=X,weight_format=bf16,output_format=bf16;...' "
-                       "with fields input_format, weight_format, weight_scaling, accumulate, output_format.")
+                       description="Configs: 'default', 'lowbit', 'all', or 'name=X,weight_format=bf16,"
+                       "output_format=bf16;...' with fields input_format, weight_format (also ternary, int4, int8), "
+                       "weight_scaling (tensor, channel, group<N>), accumulate, output_format.")
     p.add_argument("capture", nargs="?", help="capture file from routerlab.capture.RouterCapture")
     p.add_argument("--checkpoint", help="read the router weight from this checkpoint instead")
     p.add_argument("--layer", type=int, help="layer index (with --checkpoint)")
@@ -497,7 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--synthetic", type=int, metavar="N", help="use N synthetic Gaussian tokens (indicative only)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--layers", help="comma-separated router names or layer indices")
-    p.add_argument("--configs", help="precision configurations (see description)")
+    p.add_argument("--configs", help="'default', 'lowbit' (ternary/INT), 'all', or custom (see description)")
+    p.add_argument("--budget", type=float, metavar="PCT",
+                   help="plan: cheapest config per router that changes at most PCT%% of tokens' experts")
     _add_spec_args(p)
     p.add_argument("--json", help="write results to this JSON file")
     p.set_defaults(func=cmd_sweep)

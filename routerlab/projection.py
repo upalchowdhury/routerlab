@@ -7,6 +7,7 @@ import math
 import numpy as np
 
 from ._arrays import as_float64_2d, as_vector
+from .lowbit import LOWBIT_FORMATS, lowbit_project, quantize_activations, quantize_weight
 from .precision import quantize, quantize_scaled, resolve_format
 
 __all__ = ["project", "projection_error_bound"]
@@ -17,10 +18,13 @@ _ACCUMULATE = ("fp64", "fp32")
 def _cast(values: np.ndarray, fmt, scaling: str | None) -> np.ndarray:
     if fmt is None:
         return values
+    if fmt == "int8":  # activations: per-token absmax INT8 (fake-quantized)
+        codes, scales = quantize_activations(values, 8)
+        return codes * scales
     if scaling is None:
         return quantize(values, fmt).astype(np.float64)
     if scaling not in ("tensor", "channel"):
-        raise ValueError("scaling must be None, 'tensor', or 'channel'")
+        raise ValueError("scaling must be None, 'tensor', or 'channel' for float formats")
     return quantize_scaled(values, fmt, axis=None if scaling == "tensor" else -1).astype(np.float64)
 
 
@@ -30,7 +34,10 @@ def project(hidden, weight, linear_bias=None, *, input_format=None, weight_forma
 
     * ``input_format`` / ``weight_format``: emulate casting the operands first
       (e.g. ``"bf16"``); ``weight_scaling="channel"|"tensor"`` applies absmax
-      scaling as FP8 weight quantization does.
+      scaling as FP8 weight quantization does. Low-bit weights
+      (``"ternary"``, ``"int4"``, ...; granularity via ``weight_scaling``,
+      e.g. ``"group128"``) and ``input_format="int8"`` (per-token absmax) use
+      the integer-exact path of `routerlab.lowbit.lowbit_project`.
     * ``accumulate``: ``"fp64"`` (reference: the float64 product of the given
       values) or ``"fp32"`` (NumPy float32 GEMM: FP32 accumulation with a BLAS
       summation order, representative in magnitude but not bitwise equal to a
@@ -43,6 +50,15 @@ def project(hidden, weight, linear_bias=None, *, input_format=None, weight_forma
         raise ValueError(f"accumulate must be one of {_ACCUMULATE}")
     w = as_float64_2d(weight, "weight")
     x = as_float64_2d(hidden, "hidden states", width=w.shape[1])
+    if weight_format in LOWBIT_FORMATS:
+        # Integer hardware path: exact integer accumulation (ternary: adds/subtracts only).
+        if input_format not in (None, "int8"):
+            x = _cast(x, input_format, None)
+        logits = lowbit_project(x, quantize_weight(w, weight_format, weight_scaling),
+                                activation_bits=8 if input_format == "int8" else None)
+        if linear_bias is not None:
+            logits = logits + as_vector(linear_bias, "linear_bias", w.shape[0])
+        return _finish(logits, output_format)
     x = _cast(x, input_format, None)
     w = _cast(w, weight_format, weight_scaling)
     if accumulate == "fp32":
@@ -62,6 +78,10 @@ def project(hidden, weight, linear_bias=None, *, input_format=None, weight_forma
         logits = x @ w.T
         if linear_bias is not None:
             logits = logits + as_vector(linear_bias, "linear_bias", w.shape[0])
+    return _finish(logits, output_format)
+
+
+def _finish(logits: np.ndarray, output_format) -> np.ndarray:
     if not np.isfinite(logits).all():
         raise FloatingPointError("Projection overflowed (non-finite logits) under this precision")
     if output_format is not None:

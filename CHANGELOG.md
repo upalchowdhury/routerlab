@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-10-26
+
+### Added
+- `routerlab.lowbit`: BitNet b1.58 absmean ternary quantization (per tensor/channel/group),
+  symmetric INT2–INT8 weights, per-token INT8 activations, integer-exact ternary/INT projection
+  (add/subtract accumulation, one rescale), ternary packing (2-bit, base-3 at 1.6 bits/weight), and
+  storage footprints.
+- `project`, `PrecisionConfig` and sweeps accept `weight_format="ternary" | "int4" | "int8"`,
+  `weight_scaling="group<N>"` and `input_format="int8"`.
+- `LOWBIT_CONFIGS` (`routerlab sweep --configs lowbit|all`) and `plan_precision`
+  (`--budget PCT`): the cheapest per-router configuration within a routing-change budget, with
+  memory totals.
+- `routerlab inspect`: the router share of all parameters (from headers, works remotely);
+  `--lowbit` adds per-router ternary/INT4/INT8 weight error and ternary sparsity.
+- Case study `docs/case-studies/lowbit.md`: post-hoc ternary routers re-route 93–97% of tokens on
+  OLMoE and LFM2. INT8 re-routes 5–6%.
+
 ## 0.3.0 — 2026-10-25
 
 Real-world validation and the features it called for.

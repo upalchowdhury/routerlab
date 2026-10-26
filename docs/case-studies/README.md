@@ -8,6 +8,7 @@ per-layer reports are in each `summary.json`.
 | --- | --- | --- |
 | allenai/OLMoE-1B-7B-0924 | softmax, top-8 of 64 experts, 16 MoE layers | [olmoe-1b-7b](olmoe-1b-7b/summary.md) |
 | LiquidAI/LFM2-8B-A1B | sigmoid + expert bias, top-4 of 32, 22 MoE layers | [lfm2-8b-a1b](lfm2-8b-a1b/summary.md) |
+| both | ternary (BitNet b1.58) and INT4/INT8 routers | [lowbit.md](lowbit.md) |
 
 ## Headline numbers
 

@@ -216,3 +216,29 @@ def test_vllm_layers_pair_in_natural_order(tmp_path):
     np.save(tmp_path / "routed.npy", np.stack(ids, axis=1).astype(np.uint8))
     assert main(["compare", str(tmp_path / "ref.npz"), str(tmp_path / "routed.npy"), "--top-k", "2",
                  "--tolerance", "1e-9"]) == 0
+
+
+def test_lowbit_sweep_budget_and_inspect_lowbit(tmp_path, capsys):
+    rng = np.random.default_rng(9)
+    records = {f"model.layers.{i}.mlp.gate": CapturedRouter(
+        name=f"model.layers.{i}.mlp.gate", hidden_states=rng.normal(size=(128, H)).astype(np.float32),
+        weight=(rng.normal(size=(E, H)) / 5).astype(np.float32),
+        correction_bias=rng.normal(0, .05, E).astype(np.float32), linear_bias=None,
+        hidden_dtype="float32", weight_dtype="float32") for i in (1, 2)}
+    save_capture(tmp_path / "cap.safetensors", records, spec=RouterSpec.from_hf_config(CONFIG))
+    assert main(["sweep", str(tmp_path / "cap.safetensors"), "--configs", "lowbit", "--budget", "100",
+                 "--json", str(tmp_path / "plan.json")]) == 0
+    out = capsys.readouterr().out
+    assert "ternary + int8 activations (BitNet b1.58)" in out and "precision plan" in out
+    plan = json.loads((tmp_path / "plan.json").read_text())["_plan"]
+    assert all(entry["weight_bits"] == 1.58 for entry in plan.values())  # 100% budget: ternary everywhere
+
+    ckpt = tmp_path / "model"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text(json.dumps(CONFIG))
+    save_safetensors(ckpt / "model.safetensors", {
+        "model.layers.1.mlp.gate.weight": rng.normal(size=(E, H)).astype(np.float32),
+        "model.layers.1.mlp.experts.0.up_proj.weight": rng.normal(size=(64, H)).astype(np.float32)})
+    assert main(["inspect", str(ckpt), "--lowbit"]) == 0
+    out = capsys.readouterr().out
+    assert "router weights: 384 of 1,920 parameters (20.000%)" in out and "rel.err ternary" in out
