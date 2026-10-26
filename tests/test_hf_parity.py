@@ -48,7 +48,7 @@ CASES = {
     "qwen3_5_moe_text": ("qwen3_5_moe", "Qwen3_5MoeTopKRouter", dict(num_experts=E, **SOFTMAX), "lsi"),
     "olmoe": ("olmoe", "OlmoeTopKRouter", dict(num_experts=E, norm_topk_prob=False, **SOFTMAX), "lsi"),
     "flex_olmo": ("flex_olmo", "FlexOlmoTopKRouter", dict(num_experts=E, norm_topk_prob=True, **SOFTMAX), "lsi"),
-    "jamba": ("jamba", "JambaSparseMoeBlock", dict(num_experts=E, **SOFTMAX), "jamba"),
+    "jamba": ("jamba", ("JambaTopKRouter", "JambaSparseMoeBlock"), dict(num_experts=E, **SOFTMAX), "lsi"),
     "deepseek_v2": ("deepseek_v2", "DeepseekV2TopkRouter",
                     dict(n_routed_experts=E, num_experts_per_tok=K, topk_method="greedy",
                          routed_scaling_factor=1.5), "lsi"),
@@ -83,7 +83,11 @@ def _run(case):
                                   num_attention_heads=4, num_key_value_heads=4, head_dim=8, **kwargs)
     modeling = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
     torch.manual_seed(abs(hash(case)) % 2**31)
-    module = getattr(modeling, class_name)(config).float()
+    names = class_name if isinstance(class_name, tuple) else (class_name,)
+    cls = next(getattr(modeling, n) for n in names if hasattr(modeling, n))  # router classes get renamed
+    if cls.__name__ == "JambaSparseMoeBlock":  # transformers < 5.21: routing lived in the block
+        style = "jamba"
+    module = cls(config).float()
     bias = None
     with torch.no_grad():
         for name, tensor in list(module.named_parameters()) + list(module.named_buffers()):
@@ -97,12 +101,10 @@ def _run(case):
             bias = (torch.randn(E) * 0.1).numpy()
     hidden = torch.randn(M, H)
     with torch.no_grad():
-        if style == "lsi":
-            logits, weights, ids = module(hidden)
-        elif style == "isl":
-            ids, weights, logits = module(hidden)
+        if style in ("lsi", "isl"):  # tuple order changes across transformers versions: match by role
+            logits, weights, ids = _by_role(module(hidden), hidden, module)
         elif style == "bias_arg":
-            logits, weights, ids = module(hidden, torch.from_numpy(bias))
+            logits, weights, ids = _by_role(module(hidden, torch.from_numpy(bias)), hidden, module)
         elif style == "jamba":
             logits = module.router(hidden)
             ids, weights = module.route_tokens_to_experts(hidden, logits)
@@ -110,6 +112,24 @@ def _run(case):
             dense, logits = module(hidden)
             weights, ids = torch.topk(dense, config.num_experts_per_tok, dim=-1)
     return config, logits.double().numpy(), ids.numpy(), weights.double().numpy(), bias
+
+
+def _by_role(outputs, hidden, module):
+    """(logits, weights, ids) from a router's outputs, whatever their order: ids are the integer
+    tensor, logits the [M, E] float tensor equal to hidden @ W.T (+ b), weights the [M, k] one."""
+    import torch
+
+    ids = next(t for t in outputs if not t.is_floating_point())
+    weight = next(p for n, p in module.named_parameters() if p.dim() == 2)
+    expected = hidden.double() @ weight.double().T
+    linear = getattr(module, "bias", None)
+    if isinstance(linear, torch.Tensor) and linear.dim() == 1:
+        expected = expected + linear.double()
+    floats = [t for t in outputs if t.is_floating_point()]
+    same_shape = [t for t in floats if t.shape == expected.shape]
+    logits = min(same_shape, key=lambda t: float((t.double() - expected).abs().max()))
+    weights = next(t for t in floats if t.shape == ids.shape)
+    return logits, weights, ids
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
